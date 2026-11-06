@@ -249,3 +249,31 @@ fn reserved_paths_cannot_be_written() {
         "the scrape still answers"
     );
 }
+
+#[test]
+fn a_large_propfind_body_in_segments_keeps_the_connection_usable() {
+    let daemon = Daemon::start(&[]);
+    let mut wire = Wire::connect(daemon.addr);
+    let body = vec![b' '; 64 * 1024];
+    wire.send_head(
+        "PROPFIND",
+        "/dav/pre/",
+        &[
+            BEARER,
+            ("Depth", "0"),
+            ("Content-Length", &body.len().to_string()),
+        ],
+    );
+    for segment in body.chunks(16 * 1024) {
+        std::thread::sleep(Duration::from_millis(30));
+        wire.send(segment).expect("send a segment");
+    }
+    let reply = wire.read_reply().expect("PROPFIND response");
+    assert_eq!(reply.status, 207, "{}", reply.text());
+    assert!(!reply.closes(), "{:?}", reply.headers);
+    let next = wire.request("GET", "/dav/pre/.sccache_check", &[BEARER], b"");
+    assert_eq!(
+        next.status, 404,
+        "the next request on the connection is served"
+    );
+}

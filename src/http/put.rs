@@ -4,10 +4,8 @@ use axum::body::Body;
 use axum::http::header::{CONTENT_LENGTH, EXPECT};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
-use futures_util::StreamExt;
-use tracing::debug;
 
-use super::{Handled, Note, State};
+use super::{Handled, Note, State, discard};
 use crate::key::Key;
 use crate::store::{Admission, DropReason, Outcome};
 
@@ -15,7 +13,12 @@ use crate::store::{Admission, DropReason, Outcome};
 ///
 /// Nothing between the headers and the first read of the body waits (D7): the store admits
 /// synchronously, and `write` starts consuming the stream at once.
-pub(super) async fn put(state: &State, parts: &Parts, body: Body, key: &Key) -> Handled {
+pub(super) async fn put(
+    state: &State,
+    parts: &Parts,
+    body: &mut Option<Body>,
+    key: &Key,
+) -> Handled {
     let size = match announced_size(&parts.headers) {
         Ok(size) => size,
         Err(refusal) => return refusal.into_response(),
@@ -24,7 +27,10 @@ pub(super) async fn put(state: &State, parts: &Parts, body: Body, key: &Key) -> 
         Admission::Dropped(reason) => abandon(state, parts, body, reason).await,
         Admission::Reserved(reservation) => {
             // The frames go to the store as they come: no extractor buffers or decodes them.
-            match reservation.write(body.into_data_stream()).await {
+            match reservation
+                .write(body.take().unwrap_or_default().into_data_stream())
+                .await
+            {
                 Outcome::Stored => Handled {
                     bytes: size,
                     body_read: true,
@@ -56,20 +62,32 @@ pub(super) async fn put(state: &State, parts: &Parts, body: Body, key: &Key) -> 
 /// keeps its body. Without it the client has already written the body, and answering before it
 /// is read would make hyper close the connection under the client's feet, so it is read and
 /// discarded to its end first.
-async fn abandon(state: &State, parts: &Parts, body: Body, reason: DropReason) -> Handled {
+async fn abandon(
+    state: &State,
+    parts: &Parts,
+    body: &mut Option<Body>,
+    reason: DropReason,
+) -> Handled {
     state.metrics.put_dropped(reason);
     let mut handled = Handled::dropped(reason);
     if !expects_continue(&parts.headers) {
-        let mut frames = body.into_data_stream();
-        while let Some(frame) = frames.next().await {
-            if let Err(e) = frame {
-                debug!(error = %e, "client stopped sending a body that was being discarded");
-                break;
-            }
-        }
+        discard(body.take().unwrap_or_default()).await;
         handled.body_read = true;
     }
     handled
+}
+
+/// A refused PUT whose body was not read. A client that sends first, as Gradle does without
+/// `Expect`, loses the answer to a reset if the server stops reading, so the body is read and
+/// discarded unless it is announced larger than any object the store takes (or not announced:
+/// then, like under `Expect`, the answer goes out at once and the connection closes).
+pub(super) async fn drain_refused(state: &State, parts: &Parts, body: Body, handled: &mut Handled) {
+    let worth_reading = !expects_continue(&parts.headers)
+        && announced_size(&parts.headers).is_ok_and(|size| size <= state.max_object_size);
+    if worth_reading {
+        discard(body).await;
+        handled.body_read = true;
+    }
 }
 
 fn expects_continue(headers: &HeaderMap) -> bool {

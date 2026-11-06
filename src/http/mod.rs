@@ -21,7 +21,8 @@ use axum::http::header::{ALLOW, CONNECTION, WWW_AUTHENTICATE};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, Method, Request, StatusCode};
 use axum::response::Response;
-use tracing::{Level, event};
+use futures_util::StreamExt;
+use tracing::{Level, debug, event};
 
 use crate::config::{Access, AccessLog, Anonymous, Token};
 use crate::key::{Key, KeyError};
@@ -41,6 +42,8 @@ pub(crate) struct State {
     pub(crate) anonymous: Anonymous,
     /// Which requests the access log records. Errors, refusals and dropped PUTs are always logged.
     pub(crate) access_log: AccessLog,
+    /// Largest body worth reading to answer a refused PUT: the largest object the store accepts.
+    pub(crate) max_object_size: u64,
     /// Recorders for requests, hits, misses, bytes read, dropped PUTs and refusals.
     pub(crate) metrics: Metrics,
 }
@@ -100,6 +103,8 @@ enum Note {
     Dropped(DropReason),
     /// The PUT body ended early or failed; nothing was stored.
     Aborted,
+    /// Missing or invalid credentials, or a token without the right to write (D11, D38).
+    Refused,
 }
 
 impl Note {
@@ -107,6 +112,7 @@ impl Note {
         match self {
             Self::Dropped(reason) => reason.as_str(),
             Self::Aborted => "aborted",
+            Self::Refused => "refused",
         }
     }
 }
@@ -193,7 +199,31 @@ async fn handle(Shared(state): Shared<Arc<State>>, request: Request<Body>) -> Re
     served.handled.response
 }
 
+/// Routes the request, then deals with a PUT body the route left unread.
 async fn serve<'a>(state: &'a State, parts: &Parts, body: Body) -> Served<'a> {
+    let mut body = Some(body);
+    let mut served = route(state, parts, &mut body).await;
+    if let Some(unread) = body
+        && parts.method == Method::PUT
+    {
+        put::drain_refused(state, parts, unread, &mut served.handled).await;
+    }
+    served
+}
+
+/// Reads one body to its end without keeping it, so the connection can carry the next request.
+async fn discard(body: Body) {
+    let mut frames = body.into_data_stream();
+    while let Some(frame) = frames.next().await {
+        if let Err(e) = frame {
+            debug!(error = %e, "client stopped sending a body that was being discarded");
+            break;
+        }
+    }
+}
+
+/// Takes the body out of `body` only when the handler reads it.
+async fn route<'a>(state: &'a State, parts: &Parts, body: &mut Option<Body>) -> Served<'a> {
     let anonymous = |handled| Served {
         handled,
         token: "-",
@@ -211,7 +241,10 @@ async fn serve<'a>(state: &'a State, parts: &Parts, body: Body) -> Served<'a> {
             }
             Err(Refusal::Forbidden(identity)) => {
                 return Served {
-                    handled: Handled::text(StatusCode::FORBIDDEN, "this token cannot write\n"),
+                    handled: Handled {
+                        note: Some(Note::Refused),
+                        ..Handled::text(StatusCode::FORBIDDEN, "this token cannot write\n")
+                    },
                     token: identity.name,
                     key: None,
                 };
@@ -241,7 +274,9 @@ async fn serve<'a>(state: &'a State, parts: &Parts, body: Body) -> Served<'a> {
         (Op::Get, Target::Key(key)) => read::get(state, key).await,
         (Op::Head, Target::Key(key)) => read::head(state, key).await,
         (Op::Put, Target::Key(key)) => put::put(state, parts, body, key).await,
-        (Op::Propfind, target) => dav::propfind(state, parts, body, target).await,
+        (Op::Propfind, target) => {
+            dav::propfind(state, parts, body.take().unwrap_or_default(), target).await
+        }
         (Op::Mkcol, _) => dav::mkcol(),
         (Op::Options, _) => dav::options(),
         (Op::Get | Op::Head | Op::Put, Target::Root) => {
@@ -276,7 +311,10 @@ fn is_reserved(key: &Key) -> bool {
 }
 
 fn unauthorized(presented: Presented) -> Handled {
-    let mut handled = Handled::text(StatusCode::UNAUTHORIZED, "credentials required\n");
+    let mut handled = Handled {
+        note: Some(Note::Refused),
+        ..Handled::text(StatusCode::UNAUTHORIZED, "credentials required\n")
+    };
     let headers = handled.response.headers_mut();
     headers.append(
         WWW_AUTHENTICATE,
@@ -321,7 +359,9 @@ fn log_access(
     let wanted = match state.access_log {
         AccessLog::All => true,
         AccessLog::Errors => severity != Severity::Info,
-        AccessLog::Off => severity == Severity::Error || matches!(note, Some(Note::Dropped(_))),
+        AccessLog::Off => {
+            severity == Severity::Error || matches!(note, Some(Note::Dropped(_) | Note::Refused))
+        }
     };
     if !wanted {
         return;

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use common::Daemon;
-use common::wire::Wire;
+use common::wire::{Reply, Wire};
 
 const ARTIFACT: &str = "application/vnd.gradle.build-cache-artifact.v2";
 
@@ -534,4 +534,149 @@ fn the_default_access_log_keeps_errors_and_drops_but_not_hits_or_misses() {
         lines[1]
     );
     assert!(lines[1].contains("\"level\":\"WARN\""), "{}", lines[1]);
+}
+
+const EIGHT_MIB: usize = 8 * 1024 * 1024;
+
+/// What Gradle does without `Expect`: the whole body goes out before any response is read.
+fn send_first_put(wire: &mut Wire, path: &str, headers: &[(&str, &str)]) -> Reply {
+    let body = payload(EIGHT_MIB);
+    let length = body.len().to_string();
+    let mut all = headers.to_vec();
+    all.push(("Content-Length", &length));
+    wire.send_head("PUT", path, &all);
+    wire.send(&body)
+        .expect("the server must keep reading a refused body, or the client never sees the status");
+    wire.read_reply().expect("the refusal")
+}
+
+#[test]
+fn refused_puts_that_send_first_still_get_their_status() {
+    let daemon = Daemon::start_with(
+        &[],
+        &[(
+            "CACHETTE_TOKENS",
+            "ci:write:writesecret,dev:read:readsecret",
+        )],
+    );
+    let mut wire = Wire::connect(daemon.addr);
+    let key = key_for("refused");
+
+    let unauthorized = send_first_put(&mut wire, &key, &[("Authorization", "Bearer nope")]);
+    assert_eq!(unauthorized.status, 401);
+    assert!(
+        unauthorized.headers_named("www-authenticate").len() == 2,
+        "{:?}",
+        unauthorized.headers
+    );
+    assert!(
+        !unauthorized.closes(),
+        "the body was read, the connection is reusable"
+    );
+
+    let forbidden = send_first_put(&mut wire, &key, &[("Authorization", "Bearer readsecret")]);
+    assert_eq!(forbidden.status, 403);
+
+    let invalid_key = send_first_put(
+        &mut wire,
+        "/a/../b",
+        &[("Authorization", "Bearer writesecret")],
+    );
+    assert_eq!(invalid_key.status, 400);
+
+    // The same connection carries on, and nothing was stored.
+    let miss = wire.request("GET", &key, &[("Authorization", "Bearer readsecret")], b"");
+    assert_eq!(miss.status, 404);
+    assert_eq!(daemon.metric("cachette_written_bytes_total"), 0.0);
+}
+
+#[test]
+fn a_refused_put_announced_above_the_object_limit_is_answered_at_once() {
+    let daemon = Daemon::start_with(&[], &[("CACHETTE_MAX_OBJECT_SIZE", "1MiB")]);
+    let mut wire = Wire::connect(daemon.addr);
+    // Only the head is sent: a server that tried to read 8 MiB would wait for the idle timeout.
+    wire.send_head(
+        "PUT",
+        &key_for("huge"),
+        &[
+            ("Authorization", "Bearer nope"),
+            ("Content-Length", &EIGHT_MIB.to_string()),
+        ],
+    );
+    let started = Instant::now();
+    let reply = wire.read_reply().expect("the refusal");
+    assert_eq!(reply.status, 401);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        reply.closes(),
+        "the unread body ends the connection: {:?}",
+        reply.headers
+    );
+    assert!(wire.is_closed(Duration::from_secs(2)));
+
+    let mut chunked = Wire::connect(daemon.addr);
+    chunked.send_head(
+        "PUT",
+        &key_for("chunked"),
+        &[
+            ("Authorization", "Bearer nope"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+    );
+    let reply = chunked.read_reply().expect("the refusal");
+    assert_eq!(reply.status, 401);
+    assert!(reply.closes());
+
+    let mut unframed = Wire::connect(daemon.addr);
+    unframed.send_head(
+        "PUT",
+        &key_for("unframed"),
+        &[("Authorization", &basic("u", SECRET))],
+    );
+    let reply = unframed.read_reply().expect("the 411");
+    assert_eq!(reply.status, 411);
+    assert!(reply.closes());
+}
+
+#[test]
+fn access_log_off_keeps_authentication_refusals_and_nothing_else() {
+    let daemon = Daemon::start_with(
+        &[],
+        &[
+            ("CACHETTE_LOG_FORMAT", "json"),
+            ("CACHETTE_ACCESS_LOG", "off"),
+        ],
+    );
+    let auth = basic("u", SECRET);
+    let mut wire = Wire::connect(daemon.addr);
+    assert_eq!(
+        wire.request("PUT", "/k", &[("Authorization", &auth)], b"abc")
+            .status,
+        201
+    );
+    assert_eq!(
+        wire.request("GET", "/k", &[("Authorization", &auth)], b"")
+            .status,
+        200
+    );
+    assert_eq!(
+        wire.request("GET", "/k", &[("Authorization", "Bearer nope")], b"")
+            .status,
+        401
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let lines = loop {
+        let logs = daemon.logs();
+        let lines: Vec<String> = access_lines(&logs).into_iter().map(str::to_owned).collect();
+        if !lines.is_empty() || Instant::now() > deadline {
+            break lines;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(lines.len(), 1, "only the refusal: {lines:#?}");
+    assert!(lines[0].contains("\"status\":401"), "{}", lines[0]);
 }

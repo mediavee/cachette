@@ -280,6 +280,7 @@ pub(crate) fn app(config: &Config, store: Store, metrics: Metrics) -> Router {
         tokens: config.tokens.clone().into(),
         anonymous: config.anonymous,
         access_log: config.access_log,
+        max_object_size: config.max_object_size,
     });
     reserved
         .merge(keys)
