@@ -16,7 +16,7 @@ sudo timeout 3600 python3 bench/run.py --servers nginx foster bazel --work-dir /
 
 The default duration is 10 seconds **per point per repetition**. All 18 points
 (GET/PUT × 4 KiB/1 MiB/32 MiB × concurrency 1/16/64) run twice consecutively
-for each server. `--seconds`, `--cap-mib` (default 1024), `--max-load` (default 2)
+for each server. `--seconds`, `--cap-mib` (default 4096), `--max-load` (default 2)
 and `--results` are explicit overrides, recorded in the generated report.
 The default four-server matrix takes at least 24 minutes, excluding builds.
 Run only when the shared host is quiet; the preflight rejects any of the four
@@ -94,10 +94,12 @@ semantics from overwriting an arbitrary cache key; this benchmark does not
 turn that difference into a claim of equivalent implementation work.
 
 The [official CLI](https://github.com/buchgr/bazel-remote/blob/v2.6.4/README.md#command-line-flags)
-accepts `--max_size` only in whole GiB. The common default cap is therefore now
-1 GiB for every bounded server; selecting bazel rejects non-whole-GiB caps
-before Docker starts. Earlier committed reports used 256 MiB and must not be
-merged into a same-cap comparison with these new runs.
+accepts `--max_size` only in whole GiB. The common default cap is 4 GiB for every
+bounded server: 64 concurrent 32 MiB uploads can reserve 2 GiB in addition to
+retained objects. This leaves room for the throughput matrix; the separate
+3×-cap scenario still drives eviction. Selecting bazel rejects non-whole-GiB
+caps before Docker starts. Historical 256 MiB and 1 GiB reports must not be
+merged into a same-cap comparison with a 4 GiB run.
 
 bazel-remote runs with `--storage_mode uncompressed`, matching the uncompressed
 storage in the other servers; its default zstd storage is not measured. Requests
@@ -148,6 +150,13 @@ readback and the separate pressure evidence establish the behavior observed.
 
 ### Recorded dev2 runs
 
+- [Capacity-constrained three-server run, 1 GiB, 5 s per point](results/2026-11-06T173458Z-dev2.md):
+  exit 0 on source head `667d95b02d061271964c8ba3671561ad5a1b2d3c`;
+  108 measurements, three pressure traces and six RSS sample sets. Seven of
+  54 repeated points exceed ±10%. bazel-remote returns predominantly 507 for
+  32 MiB PUT at concurrency 64; those 64 uploads can total 2 GiB against a 1 GiB
+  cap. This constrained point cannot establish its unsaturated write throughput.
+  The default is now 4 GiB for all bounded servers to leave room for that point.
 - [Complete competitors run, 5 s per point](results/2026-11-06T171913Z-dev2.md):
   exit 0 on source head `6cf1af4424601be9cce1eceb130f47e888470dd1`;
   72 measurements, both pressure traces and four RSS sample sets. Nine of the

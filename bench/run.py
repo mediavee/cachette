@@ -100,7 +100,7 @@ def main():
     parser.add_argument("--servers", nargs="+", choices=PORTS, default=list(PORTS))
     parser.add_argument("--seconds", type=int, default=10)
     parser.add_argument("--max-load", type=float, default=2.0)
-    parser.add_argument("--cap-mib", type=int, default=1024)
+    parser.add_argument("--cap-mib", type=int, default=4096)
     parser.add_argument("--work-dir", type=Path, default=Path.home() / "cachette-bench")
     parser.add_argument("--results", type=Path, default=HERE / "results")
     parser.add_argument("--preflight-only", action="store_true")
