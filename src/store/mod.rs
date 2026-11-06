@@ -14,8 +14,8 @@
 //!   reservation's own room in *live* bytes — never to cover deletions already in flight — and
 //!   refuses with [`DropReason::NoSpace`] when the reservation would push live + being-deleted
 //!   past `max_size`, when even evicting everything evictable would not fit it in live bytes, or
-//!   when the disk would drop below `min_free_disk`. A sweep after each commit keeps live bytes
-//!   at or below 95 % of `max_size`, so admissions in a full store usually find their room.
+//!   when the disk would drop below `min_free_disk`. A sweep, run after the answer of a commit
+//!   that left live bytes above it, keeps them at or below 95 % of `max_size`, so admissions in a full store usually find their room.
 //!   [`Store::open`] evicts at start-up the same way, deleting synchronously before
 //!   [`Store::is_ready`] turns `true`: when the scanned objects exceed `max_size` (a smaller
 //!   `max_size` than last run), the least recently used go first. A deletion that fails keeps
@@ -354,6 +354,8 @@ struct Hooks {
     dispatches: AtomicU64,
     /// Body chunks sent to a write's owner task over its channel (D34).
     channel_sends: AtomicU64,
+    /// Sweeps down to the watermark that ran.
+    sweeps: AtomicU64,
 }
 
 /// Where a test may pause [`close_blocking`], to cancel the close there.
@@ -513,23 +515,6 @@ fn spawn_tracked(inner: &Arc<Inner>, work: impl FnOnce() + Send + 'static) {
     });
 }
 
-/// [`spawn_tracked`] for work whose result the caller awaits, with no channel in between.
-async fn blocking_tracked<T: Send + 'static>(
-    inner: &Arc<Inner>,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> T {
-    #[cfg(test)]
-    inner.hooks.dispatches.fetch_add(1, Ordering::Relaxed);
-    inner.background.fetch_add(1, Ordering::SeqCst);
-    let tracked = Arc::clone(inner);
-    blocking(move || {
-        let result = work();
-        tracked.background.fetch_sub(1, Ordering::SeqCst);
-        result
-    })
-    .await
-}
-
 fn digest_of(key: &Key) -> Digest {
     Digest(key.digest())
 }
@@ -590,8 +575,11 @@ fn watermark(max_size: u64) -> u64 {
 
 /// Evicts down to the watermark, decided under the index lock, deletions spawned
 /// outside it. Runs in writer tasks after a commit; `just_committed` is never a victim
-/// of its own sweep (a single object may legitimately exceed the watermark).
+/// of its own sweep (a single object may legitimately exceed the watermark). Called only
+/// when that commit crossed the watermark.
 fn sweep_to_watermark(inner: &Arc<Inner>, just_committed: Digest) {
+    #[cfg(test)]
+    inner.hooks.sweeps.fetch_add(1, Ordering::Relaxed);
     let evictions: Vec<PendingDelete> = {
         let mut index = inner.index.lock().expect("index lock poisoned");
         index.pin(just_committed);
@@ -1566,7 +1554,10 @@ enum WriteMsg {
 
 /// How a writer task ended.
 enum WriteResult {
-    Stored,
+    /// `over_watermark` says whether the publication left `live` above the watermark.
+    Stored {
+        over_watermark: bool,
+    },
     Aborted,
     Io(Error),
 }
@@ -1576,6 +1567,28 @@ fn release_reservation(inner: &Inner, digest: Digest, charged: u64) {
     let mut index = inner.index.lock().expect("index lock poisoned");
     index.reserved = index.reserved.saturating_sub(charged);
     index.unpin(digest);
+}
+
+/// Sends a write's result to the request waiting for it, then does the housekeeping a
+/// stored write owes: the sweep down to the watermark when the publication crossed it, and
+/// the free-disk sample. The answer comes first, so the `201` waits for neither.
+fn answer_then_housekeep(
+    inner: &Arc<Inner>,
+    digest: Digest,
+    answer: oneshot::Sender<WriteResult>,
+    result: WriteResult,
+) {
+    let stored = match result {
+        WriteResult::Stored { over_watermark } => Some(over_watermark),
+        WriteResult::Aborted | WriteResult::Io(_) => None,
+    };
+    drop(answer.send(result));
+    if let Some(over_watermark) = stored {
+        if over_watermark {
+            sweep_to_watermark(inner, digest);
+        }
+        refresh_free_disk(inner);
+    }
 }
 
 fn remove_temporary(inner: &Inner, path: &Path) {
@@ -1612,13 +1625,7 @@ impl Reservation {
         );
         spawn_tracked(&self.inner, move || {
             let result = writer_blocking(&inner, receiver, digest, &destination, size, charged);
-            let stored = matches!(result, WriteResult::Stored);
-            drop(result_sender.send(result));
-            // After the answer: the 201 does not wait for the sweep or a `statvfs`.
-            if stored {
-                sweep_to_watermark(&inner, digest);
-                refresh_free_disk(&inner);
-            }
+            answer_then_housekeep(&inner, digest, result_sender, result);
         });
         let mut body = pin!(body);
         let mut writer_gone = false;
@@ -1644,7 +1651,7 @@ impl Reservation {
         }
         drop(sender);
         match result_receiver.await {
-            Ok(WriteResult::Stored) => Outcome::Stored,
+            Ok(WriteResult::Stored { .. }) => Outcome::Stored,
             Ok(WriteResult::Aborted) => Outcome::Aborted,
             Ok(WriteResult::Io(e)) => {
                 error!(error = %e, "PUT dropped after admission");
@@ -1748,8 +1755,6 @@ fn writer_blocking(
 
 /// The whole write of a small object in one blocking pass (D43): `data` is the complete
 /// body, already checked against the announced size, so there is nothing left to wait for.
-/// Runs the post-store sweep and free-disk sample here too, since the pass has no later
-/// stage to defer them to.
 fn write_small_blocking(
     inner: &Arc<Inner>,
     data: &[u8],
@@ -1770,12 +1775,7 @@ fn write_small_blocking(
         let result = WriteResult::Io(Error::io("write", &temporary)(e));
         return abandon(inner, temporary, digest, charged, result);
     }
-    let result = validate(inner, file, temporary, destination, digest, size, charged);
-    if matches!(result, WriteResult::Stored) {
-        sweep_to_watermark(inner, digest);
-        refresh_free_disk(inner);
-    }
-    result
+    validate(inner, file, temporary, destination, digest, size, charged)
 }
 
 /// Syncs the finished temporary (`fsync` mode, D32), renames it into place and publishes
@@ -1796,6 +1796,7 @@ fn validate(
         return abandon(inner, temporary, digest, charged, result);
     }
     drop(file);
+    let over_watermark;
     {
         // One validation section covers the rename and its publication (index commit,
         // reservation conversion, unpin), in validation → index order: a pending
@@ -1822,9 +1823,12 @@ fn validate(
         index.commit(digest, size, charged, modified);
         index.reserved = index.reserved.saturating_sub(charged);
         index.unpin(digest);
+        // Decided here, under the lock the publication already holds, so the sweep takes
+        // it again only when there is something to evict.
+        over_watermark = index.live() > watermark(inner.options.max_size);
     }
     inner.options.metrics.written_bytes(size);
-    WriteResult::Stored
+    WriteResult::Stored { over_watermark }
 }
 
 impl Reservation {
@@ -1861,16 +1865,21 @@ impl Reservation {
             self.size,
             self.charged,
         );
+        let (result_sender, result_receiver) = oneshot::channel();
         let pass = Arc::clone(&inner);
-        let result = blocking_tracked(&inner, move || {
-            write_small_blocking(&pass, &data, digest, &destination, size, charged)
-        })
-        .await;
-        match result {
-            WriteResult::Stored => Outcome::Stored,
-            WriteResult::Aborted => Outcome::Aborted,
-            WriteResult::Io(e) => {
+        spawn_tracked(&inner, move || {
+            let result = write_small_blocking(&pass, &data, digest, &destination, size, charged);
+            answer_then_housekeep(&pass, digest, result_sender, result);
+        });
+        match result_receiver.await {
+            Ok(WriteResult::Stored { .. }) => Outcome::Stored,
+            Ok(WriteResult::Aborted) => Outcome::Aborted,
+            Ok(WriteResult::Io(e)) => {
                 error!(error = %e, "PUT dropped after admission");
+                Outcome::Dropped(DropReason::Io)
+            }
+            Err(_) => {
+                error!("writer task ended without a result");
                 Outcome::Dropped(DropReason::Io)
             }
         }
@@ -4047,5 +4056,83 @@ mod tests {
         eventually("the room to be released", || accounted_total(&store) == 0).await;
         assert_eq!(temporaries(&dir), 0);
         assert!(store.read(&k).await.unwrap().is_none());
+    }
+
+    // D12, D43: the answer of a stored write does not wait for its housekeeping. The
+    // free-disk sample is held, and the PUT must still be answered, small or streamed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stored_write_answers_before_its_housekeeping() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(4 * MIB)).await.unwrap();
+        ready(&store).await;
+        quiesce(&store).await;
+        store
+            .inner
+            .hooks
+            .hold_free_disk
+            .store(true, Ordering::Release);
+        let large = usize::try_from(SMALL_WRITE).unwrap() + 1;
+        let mut answers = Vec::new();
+        for (name, len) in [("small", 100), ("streamed", large)] {
+            let answered = tokio::time::timeout(
+                Duration::from_secs(2),
+                put_vec(&store, &key(name), vec![1; len]),
+            )
+            .await;
+            answers.push(answered);
+        }
+        store
+            .inner
+            .hooks
+            .hold_free_disk
+            .store(false, Ordering::Release);
+        quiesce(&store).await;
+        for answered in answers {
+            assert_eq!(
+                answered.expect("the answer waited for the housekeeping"),
+                Outcome::Stored
+            );
+        }
+    }
+
+    // D43: a stored write sweeps only when its publication left `live` above the
+    // watermark, so the common case takes the index lock once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sweep_runs_only_when_the_watermark_is_crossed() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(100 * BLOCK)).await.unwrap();
+        ready(&store).await;
+        quiesce(&store).await;
+        let sweeps = &store.inner.hooks.sweeps;
+        let before = sweeps.load(Ordering::Relaxed);
+        // 90 of 100 blocks: under the 95 % watermark.
+        for i in 0..90 {
+            assert_eq!(
+                put_vec(&store, &key(&format!("under/{i}")), vec![1; 100]).await,
+                Outcome::Stored
+            );
+        }
+        quiesce(&store).await;
+        assert_eq!(
+            sweeps.load(Ordering::Relaxed),
+            before,
+            "a sweep with nothing to evict"
+        );
+        for i in 0..10 {
+            assert_eq!(
+                put_vec(&store, &key(&format!("over/{i}")), vec![1; 100]).await,
+                Outcome::Stored
+            );
+        }
+        quiesce(&store).await;
+        assert!(
+            sweeps.load(Ordering::Relaxed) > before,
+            "no sweep past the watermark"
+        );
+        let live = store.inner.index.lock().unwrap().live();
+        assert!(
+            live <= watermark(100 * BLOCK),
+            "live {live} above the watermark"
+        );
     }
 }
