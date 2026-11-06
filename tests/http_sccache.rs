@@ -14,13 +14,24 @@ const BEARER: (&str, &str) = ("Authorization", "Bearer secret");
 const PROPFIND_BODY: &[u8] =
     br#"<?xml version="1.0" encoding="utf-8" ?><D:propfind xmlns:D="DAV:"><D:allprop/></D:propfind>"#;
 
+/// A `PROPFIND` as opendal sends it. The body follows the head in its own segment after a pause,
+/// as it does when a client writes them separately: the server must still read it, or it closes
+/// the connection the next request needs.
 fn propfind(wire: &mut Wire, path: &str) -> Reply {
-    wire.request(
+    let length = PROPFIND_BODY.len().to_string();
+    wire.send_head(
         "PROPFIND",
         path,
-        &[BEARER, ("Depth", "0"), ("Content-Type", "application/xml")],
-        PROPFIND_BODY,
-    )
+        &[
+            BEARER,
+            ("Depth", "0"),
+            ("Content-Type", "application/xml"),
+            ("Content-Length", &length),
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(30));
+    wire.send(PROPFIND_BODY).expect("send PROPFIND body");
+    wire.read_reply().expect("PROPFIND response")
 }
 
 /// Asserts the reply is the minimal collection answer opendal accepts.

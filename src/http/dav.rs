@@ -6,6 +6,7 @@
 use std::fmt::Write as _;
 use std::time::SystemTime;
 
+use axum::body::{Body, to_bytes};
 use axum::http::header::{ALLOW, CONTENT_TYPE};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode};
@@ -15,6 +16,8 @@ use tracing::error;
 use super::{ALLOWED_METHODS, Handled, State, Target};
 
 const DEPTH: &str = "depth";
+/// Largest `PROPFIND` body read; opendal sends 91 bytes.
+const MAX_PROPFIND_BODY: usize = 16 * 1024;
 const MULTISTATUS: StatusCode = StatusCode::MULTI_STATUS;
 
 /// `Allow` and `DAV: 1`.
@@ -32,7 +35,12 @@ pub(super) fn mkcol() -> Handled {
 }
 
 /// A `207` about the resource itself, whatever the depth: there is no listing in v1.
-pub(super) async fn propfind(state: &State, parts: &Parts, target: &Target) -> Handled {
+pub(super) async fn propfind(state: &State, parts: &Parts, body: Body, target: &Target) -> Handled {
+    // The request names nothing we need, but its body still has to be consumed: hyper closes the
+    // connection after the answer if it is not, and opendal sends one with every PROPFIND.
+    if to_bytes(body, MAX_PROPFIND_BODY).await.is_err() {
+        return Handled::text(StatusCode::BAD_REQUEST, "unreadable PROPFIND body\n");
+    }
     match parts.headers.get(DEPTH).map(HeaderValue::as_bytes) {
         None | Some(b"0" | b"1") => {}
         Some(depth) if depth.eq_ignore_ascii_case(b"infinity") => {

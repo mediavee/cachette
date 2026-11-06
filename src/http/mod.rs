@@ -241,7 +241,7 @@ async fn serve<'a>(state: &'a State, parts: &Parts, body: Body) -> Served<'a> {
         (Op::Get, Target::Key(key)) => read::get(state, key).await,
         (Op::Head, Target::Key(key)) => read::head(state, key).await,
         (Op::Put, Target::Key(key)) => put::put(state, parts, body, key).await,
-        (Op::Propfind, target) => dav::propfind(state, parts, target).await,
+        (Op::Propfind, target) => dav::propfind(state, parts, body, target).await,
         (Op::Mkcol, _) => dav::mkcol(),
         (Op::Options, _) => dav::options(),
         (Op::Get | Op::Head | Op::Put, Target::Root) => {
