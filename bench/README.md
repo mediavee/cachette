@@ -1,0 +1,123 @@
+# Reproducible local HTTP cache benchmark
+
+Run from a checkout on Linux x86_64 with Python 3, Git, Docker, `timeout`, `du`,
+`df`, `findmnt`, `lsblk`, `uptime` and `nproc`. No Python packages are needed.
+Docker builds install the pinned clients and servers before measuring them.
+
+```sh
+sudo timeout 3600 python3 bench/run.py --work-dir /home/debian/cachette-bench
+```
+
+Before cachette's store and HTTP implementation are merged, use:
+
+```sh
+sudo timeout 3600 python3 bench/run.py --servers nginx foster --work-dir /home/debian/cachette-bench
+```
+
+The default duration is 10 seconds **per point per repetition**. All 18 points
+(GET/PUT × 4 KiB/1 MiB/32 MiB × concurrency 1/16/64) run twice consecutively
+for each server. `--seconds`, `--cap-mib` (default 256), `--max-load` (default 2)
+and `--results` are explicit overrides, recorded in the generated report.
+The default three-server matrix takes at least 18 minutes, excluding builds.
+Run only when the shared host is quiet; the preflight rejects any of the three
+occupied TCP ports and any 1/5/15-minute load average above the threshold,
+including after building. If compilation raised the load, let it settle and
+replay the same command (Docker reuses the build cache). There is no automatic
+load-threshold bypass. CPU load is not a disk-I/O isolation guarantee.
+
+On dev2, clone under `~/cachette-bench/repo`; use only this directory and
+`cachette-bench-*` container names. The runner refuses if a container with this
+prefix already exists. It never stops another service. Data directories and
+containers are removed in `finally`, including on SIGTERM; images/build cache
+are retained for reproducibility. SIGKILL, host failure or a Docker failure can
+prevent cleanup: inspect that run before removing its named resources.
+
+## What is measured
+
+Each server runs alone in `--network host`, listening on loopback ports 18080
+(cachette), 18081 (nginx), or 18082 (fosterstack). The same freshly emptied
+`<work-dir>/run-*/data` path on the same filesystem is bind-mounted at `/data`.
+nginx's body temporary directory is also on that filesystem. nginx uses Debian
+packages with both DAV and DAV-ext; a live PROPFIND must return 207. The runner
+checks each seeded object by a full GET, exact length and SHA-256 before timing.
+All clients send the same Basic credential; nginx is intentionally unauthenticated,
+whereas both cache servers authenticate it. No TLS is used.
+
+- oha **1.14.0**, source commit `9766ca2b725b69b7606b99861d01c779b4aeb65d`,
+  builds with its locked dependencies. HTTP/1.1 keepalive, closed-loop concurrency,
+  fixed duration and `-w` to finish in-flight requests. Each request has a 120 s
+  timeout. p50/p99 are full-response latencies, including HTTP errors; error rate
+  explicitly includes non-2xx and transport errors. Raw status/error distributions
+  are retained. Successful MiB/s uses 2xx count / elapsed time × object size.
+- GET reads one warmed object. PUT repeatedly overwrites that same key: this
+  measures contention and sustained replacement, **not** unique-key ingest or
+  large-index metadata scanning. Random object bytes are generated once per size,
+  not in the timed request loop. oha holds the PUT body in its own memory.
+- During 32 MiB GET at concurrency 64, process RSS is sampled every 100 ms with
+  `docker top`, summed across all server processes. nginx master/workers can share
+  pages, so their sum can overcount. This is sampled peak RSS, not a kernel high
+  water mark; it excludes page-cache memory and client memory.
+- Pressure starts with fresh server data: 3× the cap in distinct 32 MiB objects,
+  16 concurrent uploads, with allocated bytes sampled by `du -s -B1` every 100 ms
+  through one second after uploads finish. The report includes all statuses and
+  time samples. `du` includes directories, metadata and temporary files, whereas
+  the configured caps account for blobs. Sampling can miss short overshoots.
+  This scenario does not prove LRU order or reservation correctness.
+
+cachette is built from the **current checkout** using a static musl target in
+`cachette.Dockerfile`, then packaged in scratch. Its TOML uses `data_dir`,
+`max_size`, `max_object_size`, `min_free_disk`, `fsync` and `[[tokens]]`, and its
+listen address is passed by CLI. It uses fsync=true, not a tuning exemption.
+Until the foundation/store/http lots are available, this build/config/start
+path is unverified: the competitors-only run cannot validate it. The final
+three-server command above is mandatory before any claim about cachette.
+
+fosterstack is built without source modifications at
+`31e69559cde78277192281173176a9e25d13a3bb`, with vendored dependencies and
+Go 1.27.3. `FSCACHE_MAX_BYTES` has the same value as cachette's cap and
+`FSCACHE_MAX_BODY_BYTES` is 64 MiB. Its default 32-upload bound is retained.
+nginx has no built-in storage cap or eviction policy: none is invented here.
+The pressure workload itself bounds its data to 3× the cap. nginx uses sendfile,
+automatic workers and no access log. Container log collection is disabled for
+all three; application-side formatting costs can still differ.
+
+## Reading the results
+
+`results/<UTC timestamp>-<hostname>.md` and the adjacent raw JSON are generated
+by the script, including exact package versions, image content IDs/layers,
+source commits, kernel, disk/mount, CPU count and initial/final uptime. The raw
+JSON also records load after each measured point. A partial run writes its
+failure and completed points; it is not a successful matrix.
+
+The repeatability table flags a second req/s outside ±10% of the first. Such
+points cannot establish a stable performance ranking. This is a shared host,
+without CPU pinning, frequency control or exclusive disk access; scheduler,
+background activity, per-hit metadata I/O and filesystem writeback can affect
+repeats. A short closed-loop saturation benchmark is also sensitive to warmup
+and the drain of in-flight requests. A flag identifies instability, not its
+cause: repeat on an idle host with longer `--seconds 30` before drawing a
+conclusion. No causal attribution to a server's implementation is established
+by this benchmark alone.
+
+Client and server share CPU, RAM and disk, so loopback results do not represent
+remote networking. The kernel page cache is hot; this is not a cold-disk test.
+Durability differs (nginx does not fsync writes, cachette and fosterstack do);
+this is not an equal-durability comparison. Image tags and Debian package
+repositories can move: exact built identities/versions are recorded, but a
+future rebuild is not guaranteed byte-identical. Retain the Docker images for
+an exact binary replay. A successful PUT is not proof of durable retention;
+cachette may intentionally acknowledge a dropped upload with 200. Only seed
+readback and the separate pressure evidence establish the behavior observed.
+
+No cachette performance result or competitor weakness is asserted from source
+inspection or from the competitors-only run.
+
+## Runner checks
+
+```sh
+HOME=$(mktemp -d) python3 -B -m unittest discover -s bench -v
+python3 -B bench/run.py --preflight-only
+```
+
+The CLI tests exercise both refusal paths before Docker and the free/quiet
+path. Disabling the preflight call must make the two refusal tests fail.
