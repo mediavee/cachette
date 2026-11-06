@@ -19,7 +19,8 @@ import threading
 import time
 
 HERE = Path(__file__).resolve().parent
-PORTS = {"cachette": 18080, "nginx": 18081, "foster": 18082}
+PORTS = {"cachette": 18080, "nginx": 18081, "foster": 18082, "bazel": 18083}
+BAZEL_IMAGE = "buchgr/bazel-remote-cache:v2.6.4@sha256:10285c1183e606679eb450b725c2495c055a45eb532a6c80f6b6f9771f6d2f67"
 TOKEN = "benchmark-disposable-write-token"
 AUTH = "Basic " + base64.b64encode(("bench:" + TOKEN).encode()).decode()
 
@@ -55,6 +56,15 @@ def request(server, method, key, payload=None):
         connection.close()
 
 
+def object_key(server, payload, label):
+    return "cas/" + hashlib.sha256(payload).hexdigest() if server == "bazel" else label
+
+
+def pressure_put(server, number, payload):
+    body = number.to_bytes(8, "big") + payload[8:]
+    return request(server, "PUT", object_key(server, body, f"pressure-{number}"), body)[0]
+
+
 def statistics(data):
     statuses = data["statusCodeDistribution"]
     transport = sum(data["errorDistribution"].values())
@@ -83,16 +93,18 @@ def main():
     parser.add_argument("--servers", nargs="+", choices=PORTS, default=list(PORTS))
     parser.add_argument("--seconds", type=int, default=10)
     parser.add_argument("--max-load", type=float, default=2.0)
-    parser.add_argument("--cap-mib", type=int, default=256)
+    parser.add_argument("--cap-mib", type=int, default=1024)
     parser.add_argument("--work-dir", type=Path, default=Path.home() / "cachette-bench")
     parser.add_argument("--results", type=Path, default=HERE / "results")
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
     if args.seconds < 1 or args.cap_mib < 64 or args.max_load < 0:
         parser.error("seconds >= 1, cap-mib >= 64 and max-load >= 0 required")
+    if "bazel" in args.servers and (args.cap_mib < 1024 or args.cap_mib % 1024):
+        parser.error("bazel requires cap-mib to be a positive multiple of 1024 (whole GiB)")
     preflight(args.max_load)
     if args.preflight_only:
-        print("Preflight passed: load low, all three ports free")
+        print("Preflight passed: load low, all four ports free")
         return
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         parser.error("Linux x86_64 required")
@@ -116,6 +128,7 @@ def main():
         "seconds": args.seconds, "cap_mib": args.cap_mib, "max_load": args.max_load,
         "oha": "1.14.0 / 9766ca2b725b69b7606b99861d01c779b4aeb65d",
         "foster": "31e69559cde78277192281173176a9e25d13a3bb",
+        "bazel": BAZEL_IMAGE, "bazel_storage_mode": "uncompressed",
     }
     rows, pressure, versions, probes = [], [], {}, []
     containers = []
@@ -130,13 +143,17 @@ def main():
     failure = None
     try:
         for target in ["oha"] + args.servers:
-            dockerfile = HERE / ("cachette.Dockerfile" if target == "cachette" else "Dockerfile")
-            build = ["docker", "build", "-f", str(dockerfile), "-t", f"cachette-bench-{target}"]
-            if target != "cachette":
-                build += ["--target", target]
-            command(*build, str(HERE.parent if target == "cachette" else HERE))
+            if target == "bazel":
+                command("docker", "pull", BAZEL_IMAGE)
+                command("docker", "tag", BAZEL_IMAGE, "cachette-bench-bazel")
+            else:
+                dockerfile = HERE / ("cachette.Dockerfile" if target == "cachette" else "Dockerfile")
+                build = ["docker", "build", "-f", str(dockerfile), "-t", f"cachette-bench-{target}"]
+                if target != "cachette":
+                    build += ["--target", target]
+                command(*build, str(HERE.parent if target == "cachette" else HERE))
             versions[target] = command("docker", "image", "inspect", f"cachette-bench-{target}",
-                                       "--format", "{{.Id}} {{json .RootFS.Layers}}")
+                                       "--format", "{{.Id}} {{json .RepoDigests}} {{json .RootFS.Layers}}")
         versions["nginx-packages"] = command("docker", "run", "--rm", "--name", "cachette-bench-version",
             "--entrypoint", "dpkg-query", "cachette-bench-nginx", "-W", "nginx", "libnginx-mod-http-dav-ext") if "nginx" in args.servers else "not selected"
         # Build activity must settle before any server/client measurement.
@@ -162,13 +179,19 @@ def main():
                     start += ["-e", f"{key}={value}"]
             if server == "cachette":
                 start += ["-v", f"{config}:/config.toml:ro"]
+            if server == "bazel":
+                start += ["--user", "0:0", "--entrypoint", "/bazel-remote-linux-amd64"]
             start += [f"cachette-bench-{server}"]
             if server == "cachette":
                 start += ["--config", "/config.toml", "--listen", "127.0.0.1:18080"]
+            if server == "bazel":
+                start += ["--dir", "/data", "--max_size", str(args.cap_mib // 1024),
+                          "--storage_mode", "uncompressed", "--http_address", "127.0.0.1:18083",
+                          "--grpc_address", "none", "--profile_address", "none"]
             command(*start)
             for attempt in range(100):
                 try:
-                    if request(server, "HEAD", "bench-ready")[0] == 404:
+                    if request(server, "HEAD", object_key(server, b"bench-ready", "bench-ready"))[0] == 404:
                         break
                 except OSError:
                     pass
@@ -184,7 +207,7 @@ def main():
                 payload = os.urandom(size)
                 body = run_dir / "body"
                 body.write_bytes(payload)
-                key = f"bench-{size}"
+                key = object_key(server, payload, f"bench-{size}")
                 if request(server, "PUT", key, payload)[0] not in (200, 201, 204):
                     raise RuntimeError(f"{server}: seed PUT failed")
                 status, length, digest = request(server, "GET", key)
@@ -252,7 +275,7 @@ def main():
             pressure_monitor.start()
             count = args.cap_mib // 32 * 3
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-                statuses = list(pool.map(lambda n: request(server, "PUT", f"pressure-{n}", payload)[0], range(count)))
+                statuses = list(pool.map(lambda n: pressure_put(server, n, payload), range(count)))
             time.sleep(1)
             pressure_stop.set()
             pressure_monitor.join()
@@ -289,7 +312,7 @@ def render(path, raw, metadata, versions, probes, rows, pressure, failure):
              "", "## Versions", "", "```json", json.dumps(versions, indent=2), "```", "", "## HTTP probes", ""]
     lines += [f"- {probe}" for probe in probes]
     lines += ["", f"Run failure: {failure or 'none'}.", "", "## Throughput and latency", "",
-              "PUT is repeated overwrite of one key; GET is a warmed hit on that key. HTTP/1.1 keepalive.",
+              "PUT repeatedly uploads one key (CAS on bazel-remote); GET is a warmed hit on that key. HTTP/1.1 keepalive.",
               "Errors include non-2xx and transport errors. MiB/s is successful requests/s × payload size (PUT ingress, GET egress).",
               "RSS is summed process RSS sampled every 100 ms (shared pages may be counted twice).", "",
               "| Server | Method | Bytes | c | Run | req/s | MiB/s | p50 ms | p99 ms | Errors % | Peak RSS MiB |",

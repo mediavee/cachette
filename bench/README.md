@@ -11,15 +11,15 @@ sudo timeout 3600 python3 bench/run.py --work-dir /home/debian/cachette-bench
 Before cachette's store and HTTP implementation are merged, use:
 
 ```sh
-sudo timeout 3600 python3 bench/run.py --servers nginx foster --work-dir /home/debian/cachette-bench
+sudo timeout 3600 python3 bench/run.py --servers nginx foster bazel --work-dir /home/debian/cachette-bench
 ```
 
 The default duration is 10 seconds **per point per repetition**. All 18 points
 (GET/PUT × 4 KiB/1 MiB/32 MiB × concurrency 1/16/64) run twice consecutively
-for each server. `--seconds`, `--cap-mib` (default 256), `--max-load` (default 2)
+for each server. `--seconds`, `--cap-mib` (default 1024), `--max-load` (default 2)
 and `--results` are explicit overrides, recorded in the generated report.
-The default three-server matrix takes at least 18 minutes, excluding builds.
-Run only when the shared host is quiet; the preflight rejects any of the three
+The default four-server matrix takes at least 24 minutes, excluding builds.
+Run only when the shared host is quiet; the preflight rejects any of the four
 occupied TCP ports and a 1-minute load average above the threshold,
 including after building. The 5/15-minute historical averages are recorded,
 not used to reject a currently quiet host. If compilation raised the load, let it settle and
@@ -36,13 +36,14 @@ prevent cleanup: inspect that run before removing its named resources.
 ## What is measured
 
 Each server runs alone in `--network host`, listening on loopback ports 18080
-(cachette), 18081 (nginx), or 18082 (fosterstack). The same freshly emptied
+(cachette), 18081 (nginx), 18082 (fosterstack), or 18083 (bazel-remote). The same freshly emptied
 `<work-dir>/run-*/data` path on the same filesystem is bind-mounted at `/data`.
 nginx's body temporary directory is also on that filesystem. nginx uses Debian
 packages with both DAV and DAV-ext; a live PROPFIND must return 207. The runner
 checks each seeded object by a full GET, exact length and SHA-256 before timing.
 All clients send the same Basic credential; nginx is intentionally unauthenticated,
-whereas both cache servers authenticate it. No TLS is used.
+whereas cachette and fosterstack authenticate it. bazel-remote is also
+unauthenticated, with the same credential header still sent. No TLS is used.
 
 - oha **1.14.0**, source commit `9766ca2b725b69b7606b99861d01c779b4aeb65d`,
   builds with its locked dependencies. HTTP/1.1 keepalive, closed-loop concurrency,
@@ -50,7 +51,7 @@ whereas both cache servers authenticate it. No TLS is used.
   timeout. p50/p99 are full-response latencies, including HTTP errors; error rate
   explicitly includes non-2xx and transport errors. Raw status/error distributions
   are retained. Successful MiB/s uses 2xx count / elapsed time × object size.
-- GET reads one warmed object. PUT repeatedly overwrites that same key: this
+- GET reads one warmed object. PUT repeatedly uploads that same key: this
   measures contention and sustained replacement, **not** unique-key ingest or
   large-index metadata scanning. Random object bytes are generated once per size,
   not in the timed request loop. oha holds the PUT body in its own memory.
@@ -72,7 +73,7 @@ cachette is built from the **current checkout** using a static musl target in
 listen address is passed by CLI. It uses fsync=true, not a tuning exemption.
 Until the foundation/store/http lots are available, this build/config/start
 path is unverified: the competitors-only run cannot validate it. The final
-three-server command above is mandatory before any claim about cachette.
+four-server command above is mandatory before any claim about cachette.
 
 fosterstack is built without source modifications at
 `31e69559cde78277192281173176a9e25d13a3bb`, with vendored dependencies and
@@ -81,7 +82,40 @@ Go 1.27.3. `FSCACHE_MAX_BYTES` has the same value as cachette's cap and
 nginx has no built-in storage cap or eviction policy: none is invented here.
 The pressure workload itself bounds its data to 3× the cap. nginx uses sendfile,
 automatic workers and no access log. Container log collection is disabled for
-all three; application-side formatting costs can still differ.
+all four; application-side formatting costs can still differ.
+
+
+bazel-remote uses the official image for [v2.6.4](https://github.com/buchgr/bazel-remote/releases/tag/v2.6.4),
+the latest published release verified on 2026-11-06. `BAZEL_IMAGE` in `run.py`
+pins that release's Linux amd64 manifest by digest, also retained in the report.
+Its HTTP keys are `/cas/<sha256 of body>`; both seed readback and the pressure
+workload use valid content addresses. Repeated CAS uploads may have different
+semantics from overwriting an arbitrary cache key; this benchmark does not
+turn that difference into a claim of equivalent implementation work.
+
+The [official CLI](https://github.com/buchgr/bazel-remote/blob/v2.6.4/README.md#command-line-flags)
+accepts `--max_size` only in whole GiB. The common default cap is therefore now
+1 GiB for every bounded server; selecting bazel rejects non-whole-GiB caps
+before Docker starts. Earlier committed reports used 256 MiB and must not be
+merged into a same-cap comparison with these new runs.
+
+bazel-remote runs with `--storage_mode uncompressed`, matching the uncompressed
+storage in the other servers; its default zstd storage is not measured. Requests
+are uncompressed HTTP. The server still verifies CAS hashes and syncs files
+before completing PUTs ([implementation](https://github.com/buchgr/bazel-remote/blob/v2.6.4/cache/disk/disk.go)).
+This does not establish durability equivalent to cachette's file and directory
+syncs. No extra hard-limit or disk-I/O-concurrency tuning is added. The stock
+image's entrypoint enables a profiling listener, so the runner overrides that
+entrypoint and explicitly disables profiling and gRPC: only loopback HTTP
+18083 is enabled. It uses uid 0 for the same disposable bind-mount permissions
+as the other benchmark servers.
+
+For pressure, every server now receives distinct 32 MiB bodies: the first eight
+bytes encode the object number. This is required to prevent CAS deduplication
+from turning a nominal 3×-cap workload into one retained blob. Creation of each
+body and its CAS key happens on the client during the pressure scenario; pressure
+wall time is not a timed PUT-throughput comparison. Hash generation for the
+fixed timed object is outside the oha load interval.
 
 ## Reading the results
 
@@ -103,7 +137,8 @@ by this benchmark alone.
 
 Client and server share CPU, RAM and disk, so loopback results do not represent
 remote networking. The kernel page cache is hot; this is not a cold-disk test.
-Durability differs (nginx does not fsync writes, cachette and fosterstack do);
+Durability differs (nginx does not fsync writes; cachette, fosterstack and
+bazel-remote have different sync/persistence paths);
 this is not an equal-durability comparison. Image tags and Debian package
 repositories can move: exact built identities/versions are recorded, but a
 future rebuild is not guaranteed byte-identical. Retain the Docker images for
@@ -134,10 +169,10 @@ In the complete run, fosterstack PUT at concurrency 64 returns predominantly
 successful storage performance; use the error and useful MiB/s columns together.
 The default 32-upload admission bound is retained, not tuned for this benchmark.
 
-To replay the complete initial measurement exactly:
+To replay the historical two-server, 256 MiB workload with the current runner:
 
 ```sh
-sudo timeout 3600 python3 -B bench/run.py --servers nginx foster --seconds 5 --work-dir /home/debian/cachette-bench
+sudo timeout 3600 python3 -B bench/run.py --servers nginx foster --seconds 5 --cap-mib 256 --work-dir /home/debian/cachette-bench
 ```
 
 No cachette comparison follows from these competitors-only results.
@@ -152,4 +187,6 @@ python3 -B bench/run.py --preflight-only
 
 The CLI tests exercise both refusal paths before Docker and the free/quiet
 path, correct error/goodput reporting, and disappearing temporary files during disk
-scans without hiding permission failures. Disabling the preflight call must make the two refusal tests fail.
+scans without hiding permission failures. CAS tests send real HTTP PUTs to a
+validating fixture and check content addresses and distinct pressure objects.
+The port check includes 18083; fractional-GiB caps are rejected for bazel. Disabling the preflight call must make the two refusal tests fail.

@@ -1,5 +1,8 @@
 from pathlib import Path
 import socket
+import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 import subprocess
 import tempfile
 
@@ -25,12 +28,18 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_occupied_port_refused_before_docker(self):
-        with socket.socket() as sock:
-            sock.bind(("0.0.0.0", 18081))
-            sock.listen()
-            result = self.cli(f'import os, runpy, sys; os.getloadavg=lambda: (0, 0, 0); sys.argv=[{str(RUN)!r}, "--preflight-only"]; runpy.run_path({str(RUN)!r}, run_name="__main__")')
+        for port in [18081, 18083]:
+            with self.subTest(port=port), socket.socket() as sock:
+                sock.bind(("0.0.0.0", port))
+                sock.listen()
+                result = self.cli(f'import os, runpy, sys; os.getloadavg=lambda: (0, 0, 0); sys.argv=[{str(RUN)!r}, "--preflight-only"]; runpy.run_path({str(RUN)!r}, run_name="__main__")')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"port {port} is occupied", result.stderr)
+
+    def test_bazel_rejects_fractional_gib_caps_before_docker(self):
+        result = self.cli(f'import runpy, sys; sys.argv=[{str(RUN)!r}, "--servers", "bazel", "--cap-mib", "256", "--preflight-only"]; runpy.run_path({str(RUN)!r}, run_name="__main__")')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("port 18081 is occupied", result.stderr)
+        self.assertIn("bazel requires cap-mib to be a positive multiple of 1024", result.stderr)
 
     def test_low_load_and_free_ports_allowed(self):
         result = self.cli(f'import os, runpy, sys; os.getloadavg=lambda: (0, 0, 0); sys.argv=[{str(RUN)!r}, "--preflight-only"]; runpy.run_path({str(RUN)!r}, run_name="__main__")')
@@ -62,6 +71,51 @@ class DiskSamplingTests(unittest.TestCase):
             with patch.object(Path, "stat", side_effect=PermissionError("denied")):
                 with self.assertRaises(PermissionError):
                     run.allocated_bytes(Path(directory))
+
+
+class BazelCASTests(unittest.TestCase):
+    def setUp(self):
+        self.objects = {}
+        objects = self.objects
+
+        class CASHandler(BaseHTTPRequestHandler):
+            def do_PUT(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                expected = "/cas/" + hashlib.sha256(body).hexdigest()
+                if self.path == expected:
+                    objects[self.path] = body
+                    self.send_response(201)
+                else:
+                    self.send_response(400)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), CASHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.start()
+        self.port = patch.dict(run.PORTS, {"bazel": self.server.server_port})
+        self.port.start()
+
+    def tearDown(self):
+        self.port.stop()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    def test_seed_url_is_the_sha256_of_the_uploaded_body(self):
+        key = run.object_key("bazel", b"abc", "bench-3")
+        self.assertEqual(key, "cas/ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        self.assertEqual(run.request("bazel", "PUT", key, b"abc")[0], 201)
+        self.assertEqual(self.objects["/" + key], b"abc")
+
+    def test_pressure_creates_distinct_valid_cas_objects(self):
+        statuses = [run.pressure_put("bazel", n, b"x" * 32) for n in range(3)]
+        self.assertEqual(statuses, [201, 201, 201])
+        self.assertEqual(len(self.objects), 3)
+        self.assertEqual({len(body) for body in self.objects.values()}, {32})
 
 
 class ReportTests(unittest.TestCase):
