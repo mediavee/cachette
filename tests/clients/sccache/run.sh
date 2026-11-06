@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Real sccache (pinned v0.19.0 release binary) against a real cachette, over WebDAV (D8, D26).
 #
-#   tests/clients/sccache/run.sh [default|no-create-dir ...]    (default: both)
+#   tests/clients/sccache/run.sh [default|no-create-dir|drop ...]    (default: all three)
 #
 # First build writes with a write token; after `cargo clean` the second build reads with a read
-# token in READ_ONLY mode and must hit remotely.
+# token in READ_ONLY mode and must hit remotely. `drop` runs the same two builds against a server
+# whose max_object_size splits the demo crate's objects (D5).
 #
 # Environment:
 #   CACHETTE_BIN       the server binary (default target/release/cachette)
 #   SCCACHE_BIN        use this sccache instead of the pinned download
 #   CLIENTS_SKIP_WARMUP=1   skips the first build: the hit checks must then fail
+#   DROP_MAX_OBJECT_SIZE    the limit of `drop` (default 128KiB); one that splits nothing must fail it
 # Ports 18092 (cachette) and 18094 (the sccache server); 18093 stays free for the second variant.
 set -euo pipefail
 
@@ -90,11 +92,62 @@ variant() { # NAME PORT DIRECTORY_TRAFFIC(yes|no) [VAR=VALUE...]
     stop_cachette
 }
 
-scenarios="${*:-default no-create-dir}"
+# access_puts STATUS: the PUTs of sccache objects the server logged with that status. The log is
+# written behind the response, so it is polled for a moment.
+access_puts() {
+    i=0
+    while [ "$i" -lt 50 ]; do
+        n="$(grep 'method="PUT"' "$WORK/cachette.log" | grep -v 'key=.sccache_check' | grep -c "status=$1" || true)"
+        [ "$n" -gt 0 ] && break
+        sleep 0.1
+        i=$((i + 1))
+    done
+    echo "$n"
+}
+
+# D5: the objects over max_object_size get a 413. sccache counts a missed write, the build still
+# succeeds, the objects under the limit are stored and the second build hits exactly those.
+# 128KiB splits the demo crate's objects (80 kB to 340 kB on aarch64-apple-darwin); the split is
+# read back from the access log instead of assumed.
+drop() {
+    limit="${DROP_MAX_OBJECT_SIZE:-128KiB}"
+    log "sccache variant: drop, max_object_size=$limit"
+    start_cachette 18092 "$limit"
+    rm -rf "$CARGO_TARGET_DIR"
+
+    sccache_server "$WRITE_TOKEN"
+    build
+    s="$(stats)"
+    echo "$s" | jq '.stats | {cache_misses, cache_writes, cache_write_errors}' -c
+    stored="$(access_puts 201)"
+    dropped="$(access_puts 413)"
+    printf 'access log: %s objects stored (201), %s dropped (413)\n' "$stored" "$dropped"
+    [ "$(echo "$s" | jq '.stats.cache_write_errors')" -eq "$dropped" ] || fail "sccache did not count one failed write per dropped object"
+    assert_ge "objects stored" "$stored" 1
+    assert_ge "objects dropped with a 413" "$dropped" 1
+    assert_ge "dropped PUTs (too_large)" "$(metric cachette_puts_dropped_total 'reason="too_large"')" "$dropped"
+    [ "$(metric cachette_requests_total 'method="PUT",status="413"')" -eq "$dropped" ] || fail "413 count differs between the access log and the metrics"
+
+    (cd "$CRATE" && cargo clean --quiet)
+    sccache_server "$READ_TOKEN" SCCACHE_WEBDAV_RW_MODE=READ_ONLY
+    "$SCCACHE_BIN" --zero-stats >/dev/null
+    build
+    s="$(stats)"
+    echo "$s" | jq '.stats | {cache_hits, cache_misses, cache_read_errors}' -c
+    hits="$(echo "$s" | jq '[.stats.cache_hits.counts[]] | add // 0')"
+    misses="$(echo "$s" | jq '[.stats.cache_misses.counts[]] | add // 0')"
+    [ "$hits" -eq "$stored" ] || fail "sccache hits ($hits) differ from the objects stored ($stored)"
+    [ "$misses" -eq "$dropped" ] || fail "sccache misses ($misses) differ from the objects dropped ($dropped)"
+    "$SCCACHE_BIN" --stop-server >/dev/null 2>&1 || true
+    stop_cachette
+}
+
+scenarios="${*:-default no-create-dir drop}"
 for scenario in $scenarios; do
     case "$scenario" in
         default) variant default 18092 yes ;;
         no-create-dir) variant no-create-dir 18093 no SCCACHE_WEBDAV_DISABLE_CREATE_DIR=true ;;
+        drop) drop ;;
         *) fail "unknown scenario $scenario" ;;
     esac
 done

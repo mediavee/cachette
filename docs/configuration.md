@@ -142,7 +142,7 @@ duration in microseconds and token name:
 
 | Value | Logged |
 |---|---|
-| `errors` (default) | Failures, refusals (`401`, `403`), client errors other than `404`, and PUTs answered `200` without being stored. |
+| `errors` (default) | Failures, refusals (`401`, `403`), client errors other than `404`, and PUTs that are not stored. |
 | `all` | Every request. A line per hit costs a syscall: for debugging. |
 | `off` | Only server errors, refused credentials and dropped PUTs. |
 

@@ -1,7 +1,7 @@
 //! `PUT` on a key (D4 to D7).
 
 use axum::body::Body;
-use axum::http::header::{CONTENT_LENGTH, EXPECT};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, EXPECT};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 
@@ -40,7 +40,7 @@ pub(super) async fn put(
                     state.metrics.put_dropped(reason);
                     Handled {
                         body_read: true,
-                        ..Handled::dropped(reason)
+                        ..not_stored(parts, reason)
                     }
                 }
                 Outcome::Aborted => Handled {
@@ -56,7 +56,7 @@ pub(super) async fn put(
     }
 }
 
-/// The PUT is not stored but must not hurt the client (D5, D7).
+/// The PUT is not stored; the answer must still leave the connection usable (D5, D7).
 ///
 /// With `Expect: 100-continue` the answer goes out unread: hyper sends no `100`, and the client
 /// keeps its body. Without it the client has already written the body, and answering before it
@@ -69,12 +69,34 @@ async fn abandon(
     reason: DropReason,
 ) -> Handled {
     state.metrics.put_dropped(reason);
-    let mut handled = Handled::dropped(reason);
+    let mut handled = not_stored(parts, reason);
     if !expects_continue(&parts.headers) {
         discard(body.take().unwrap_or_default()).await;
         handled.body_read = true;
     }
     handled
+}
+
+/// The answer to a PUT that is not stored, whatever the reason (D5): the one place that picks
+/// its status.
+fn not_stored(parts: &Parts, reason: DropReason) -> Handled {
+    // Gradle's HttpBuildCacheService.store throws on any non-2xx status and the remote cache is
+    // then off for the rest of the build, so it gets 200; `tests/clients/gradle/run.sh d5` fails
+    // when Gradle gets 413.
+    let status = if is_gradle_artifact(&parts.headers) {
+        StatusCode::OK
+    } else {
+        StatusCode::PAYLOAD_TOO_LARGE
+    };
+    Handled::dropped(reason, status)
+}
+
+fn is_gradle_artifact(headers: &HeaderMap) -> bool {
+    const PREFIX: &[u8] = b"application/vnd.gradle.build-cache-artifact";
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.as_bytes().get(..PREFIX.len()))
+        .is_some_and(|start| start.eq_ignore_ascii_case(PREFIX))
 }
 
 /// A refused PUT whose body was not read. A client that sends first, as Gradle does without
@@ -126,4 +148,39 @@ fn announced_size(headers: &HeaderMap) -> Result<u64, Unframed> {
         .ok()
         .and_then(|text| text.parse().ok())
         .ok_or(Unframed::Invalid)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::Request;
+
+    use super::*;
+
+    fn status_for(content_type: Option<&str>, reason: DropReason) -> StatusCode {
+        let mut request = Request::builder().method("PUT").uri("/k");
+        if let Some(content_type) = content_type {
+            request = request.header(CONTENT_TYPE, content_type);
+        }
+        let (parts, ()) = request.body(()).expect("request").into_parts();
+        not_stored(&parts, reason).response.status()
+    }
+
+    #[test]
+    fn every_drop_reason_answers_413_except_to_gradle() {
+        for reason in DropReason::ALL {
+            assert_eq!(status_for(None, reason), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(
+                status_for(Some("application/octet-stream"), reason),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+            assert_eq!(
+                status_for(
+                    Some("application/vnd.gradle.build-cache-artifact.v1"),
+                    reason
+                ),
+                StatusCode::OK,
+                "{reason:?}"
+            );
+        }
+    }
 }

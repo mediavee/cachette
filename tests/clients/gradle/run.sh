@@ -89,8 +89,9 @@ roundtrip() { # EXPECT_CONTINUE
     assert_ge "server hits" "$(metric cachette_hits_total)" 4
 }
 
-# D5: an output larger than max_object_size and than any socket buffer is dropped with a 200;
-# the build passes, the cache stays on, the other entries are stored and served.
+# D5: an output larger than max_object_size and than any socket buffer is dropped, and Gradle gets
+# a 200 (any other status turns its remote cache off); the build passes, the cache stays on, the
+# other entries are stored and served.
 d5() { # EXPECT_CONTINUE
     expect="$1"
     blob_mib=10

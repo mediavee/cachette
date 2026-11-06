@@ -99,7 +99,7 @@ enum Target {
 /// Why a request was not served as asked, beyond its status. Shown in the access log.
 #[derive(Debug, Clone, Copy)]
 enum Note {
-    /// The PUT was answered 200 without being stored (D5).
+    /// The PUT was not stored (D5).
     Dropped(DropReason),
     /// The PUT body ended early or failed; nothing was stored.
     Aborted,
@@ -150,11 +150,11 @@ impl Handled {
         Self::new(response)
     }
 
-    /// A PUT that is not stored and still answered 200 (D5).
-    fn dropped(reason: DropReason) -> Self {
+    /// A PUT that is not stored, answered with `status` (D5).
+    fn dropped(reason: DropReason, status: StatusCode) -> Self {
         Self {
             note: Some(Note::Dropped(reason)),
-            ..Self::status(StatusCode::OK)
+            ..Self::status(status)
         }
     }
 

@@ -511,7 +511,7 @@ fn the_default_access_log_keeps_errors_and_drops_but_not_hits_or_misses() {
     assert_eq!(wire.request("GET", "/k", &[], b"").status, 401);
     let big = vec![0_u8; 4096];
     let dropped = wire.request("PUT", "/big", &[("Authorization", &auth)], &big);
-    assert_eq!(dropped.status, 200);
+    assert_eq!(dropped.status, 413);
     // The line for the last request is written after its response.
     let deadline = Instant::now() + Duration::from_secs(5);
     let lines = loop {
@@ -529,7 +529,7 @@ fn the_default_access_log_keeps_errors_and_drops_but_not_hits_or_misses() {
     );
     assert!(lines[0].contains("\"status\":401"), "{}", lines[0]);
     assert!(
-        lines[1].contains("\"status\":200") && lines[1].contains("\"note\":\"too_large\""),
+        lines[1].contains("\"status\":413") && lines[1].contains("\"note\":\"too_large\""),
         "{}",
         lines[1]
     );
