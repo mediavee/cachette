@@ -89,10 +89,11 @@ hyper-util = { version = "0.1.21", features = ["tokio", "server", "http1", "serv
 metrics = { version = "0.24.6", default-features = false }
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 percent-encoding = "2.3.2"
+rustix = { version = "1.1.6", features = ["fs"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "fs", "signal", "time", "io-util"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "fs", "signal", "time", "io-util", "sync"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7.20", default-features = false, features = ["io"] }
 toml = "1.2.1"

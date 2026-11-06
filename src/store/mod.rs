@@ -66,20 +66,25 @@
 //!   each eviction and `crash_purge`, through the [`Metrics`] in its [`Options`]. `http` records
 //!   everything else.
 //!
-//! # The naive implementation
+//! # The implementation
 //!
-//! Files live at `objects/<2 hex>/<64 hex>` ([`Key::relative_path`]). There is no index and no
-//! eviction: a full store refuses writes with `no_space`. Totals are exact because validations
-//! are serialised by their own lock, apart from the accounting lock. Writes use `tokio::fs`, not
-//! the D34 task. Recency, `touch_interval`, `min_free_disk` and the crash recovery are not
-//! implemented: a [`Durability::PurgeOnCrash`] store simply does not sync.
+//! Files live at `objects/<2 hex>/<64 hex>` (the blake3 digest of the key). The in-memory
+//! index ([`index::Index`]) maps that digest to a compact entry and keeps the LRU order in an
+//! intrusive list, behind the one `Mutex` of D15. Admission decides evictions under that lock;
+//! deletions, `mtime` touches, file opens and every other I/O run outside it, on the blocking
+//! pool. Validations and pending deletions are serialised against each other by the separate
+//! validation lock, so a deletion decided against an old generation can never unlink a version
+//! renamed after it.
 
 #![expect(
     dead_code,
     reason = "the http lot is the caller; removed once it uses the whole API"
 )]
 
-use std::io;
+mod index;
+
+use std::fs::File as StdFile;
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -89,20 +94,31 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use thiserror::Error;
-use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
+use tokio::fs::File;
 use tokio::runtime::Handle;
-use tokio_util::io::ReaderStream;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::{error, warn};
 
 use crate::config::Durability;
 use crate::key::Key;
 use crate::metrics::Metrics;
+use index::{Digest, Index};
 
 /// Granularity of the space accounting (D12).
 const BLOCK: u64 = 4096;
-/// Size of the chunks a read streams, so memory does not depend on object size (D15).
+/// Size of the chunks a read streams, so memory does not depend on object size (D15, D33).
 const READ_CHUNK: usize = 64 * 1024;
+/// Objects at most this large are read by one blocking task into a single `Bytes` (D33).
+const SMALL_OBJECT: u64 = 64 * 1024;
+/// Depth of the channel feeding a write's blocking task (D34).
+const WRITE_CHANNEL_DEPTH: usize = 4;
+/// `BufWriter` capacity of a write's blocking task (D34).
+const WRITE_BUFFER: usize = 64 * 1024;
+/// Chunks a streaming read may have in flight: at most twice [`READ_CHUNK`] bytes per reader.
+const READ_CHANNEL_DEPTH: usize = 2;
+/// Shards under `objects/`: the first digest byte, in hex.
+const SHARDS: u32 = 256;
 
 /// Limits and durability settings the store is opened with.
 #[derive(Debug, Clone)]
@@ -112,12 +128,10 @@ pub(crate) struct Options {
     /// Largest accepted object, in bytes. Never above `max_size`.
     pub(crate) max_object_size: u64,
     /// Free space the disk must keep after a reservation, in bytes.
-    #[expect(dead_code, reason = "read by the disk store, not by the naive one")]
     pub(crate) min_free_disk: u64,
     /// What a write spends to survive a crash.
     pub(crate) durability: Durability,
     /// Minimum delay between two persisted recency updates of one entry.
-    #[expect(dead_code, reason = "read by the disk store, not by the naive one")]
     pub(crate) touch_interval: Duration,
     /// Where the store records what it writes, evicts and purges.
     pub(crate) metrics: Metrics,
@@ -188,9 +202,58 @@ pub(crate) struct Object {
 }
 
 impl Object {
-    /// Streams the file in bounded chunks.
+    /// Streams the file in bounded chunks (D33): one blocking task reads a small object
+    /// whole into a single `Bytes`; a larger one is read in [`READ_CHUNK`] blocks, never
+    /// past the known length.
     pub(crate) fn into_stream(self) -> impl Stream<Item = io::Result<Bytes>> + Send {
-        ReaderStream::with_capacity(self.file, READ_CHUNK)
+        let (sender, receiver) = mpsc::channel(READ_CHANNEL_DEPTH);
+        let size = self.size;
+        match self.file.try_into_std() {
+            Ok(file) => spawn_background(move || read_file(file, size, &sender)),
+            Err(file) => match Handle::try_current() {
+                // A read is in flight on this handle: wait it out off the request path.
+                Ok(runtime) => drop(runtime.spawn(async move {
+                    let file = file.into_std().await;
+                    spawn_background(move || read_file(file, size, &sender));
+                })),
+                Err(_) => {
+                    let _ = sender
+                        .blocking_send(Err(io::Error::other("no runtime to read the object on")));
+                }
+            },
+        }
+        futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|chunk| (chunk, receiver))
+        })
+    }
+}
+
+/// Reads exactly `size` bytes from the start of `file`, sending each block before reading
+/// the next. Runs on the blocking pool; stops when the reader goes away.
+fn read_file(mut file: StdFile, size: u64, sender: &mpsc::Sender<io::Result<Bytes>>) {
+    if size <= SMALL_OBJECT {
+        let len = usize::try_from(size).unwrap_or(usize::MAX);
+        let mut buffer = vec![0_u8; len];
+        let chunk = match file.read_exact(&mut buffer) {
+            Ok(()) => Ok(Bytes::from(buffer)),
+            Err(e) => Err(e),
+        };
+        let _ = sender.blocking_send(chunk);
+        return;
+    }
+    let mut remaining = size;
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(u64::try_from(READ_CHUNK).unwrap_or(u64::MAX)))
+            .unwrap_or(READ_CHUNK);
+        let mut buffer = vec![0_u8; want];
+        if let Err(e) = file.read_exact(&mut buffer) {
+            let _ = sender.blocking_send(Err(e));
+            return;
+        }
+        remaining = remaining.saturating_sub(u64::try_from(want).unwrap_or(u64::MAX));
+        if sender.blocking_send(Ok(Bytes::from(buffer))).is_err() {
+            return;
+        }
     }
 }
 
@@ -238,26 +301,54 @@ pub(crate) enum Outcome {
     Aborted,
 }
 
+/// Test-only fault and timing injection. Every knob is inert in a normal build.
 #[derive(Debug, Default)]
-struct Accounts {
-    size: u64,
-    entries: u64,
-    reserved: u64,
+struct Hooks {
+    /// Pending deletions wait until this is cleared (criterion 1b).
+    hold_deletions: AtomicBool,
+    /// The start-up scan waits until this is cleared (`not_ready` window).
+    hold_scan: AtomicBool,
+    /// `syncfs` at close reports an error (criterion 9).
+    fail_syncfs: AtomicBool,
+    /// One read unlinks the object file between its lookup and its open (criterion 1c):
+    /// 1 = just unlink, 2 = unlink, then (3) a replacement appears before the retry.
+    vanish_on_read: AtomicU64,
 }
 
 #[derive(Debug)]
 struct Inner {
     root: PathBuf,
     options: Options,
-    /// O(1) accounting; held for a few instructions, never across I/O (D35).
-    accounts: Mutex<Accounts>,
-    /// Serialises validations so a replaced version is counted exactly once. Only
-    /// [`commit_blocking`] takes it, so a validation stuck in I/O cannot stall an admission.
+    /// The index; held for a few O(1) instructions, never across I/O or an `.await` (D35).
+    index: Mutex<Index>,
+    /// Serialises validations against each other and against pending deletions, so a
+    /// deletion decided before a rename cannot unlink the renamed version. Only writer
+    /// tasks and deletion tasks take it, so I/O under it cannot stall an admission.
     validation: Mutex<()>,
     ready: AtomicBool,
+    closed: AtomicBool,
     next_tmp: AtomicU64,
+    /// Background tasks (scan, deletions, touches, writers) still running; `close` waits
+    /// for zero beyond itself before it may call the run clean.
+    background: AtomicU64,
+    /// Last free-disk sample, refreshed off the request path so `admit` does no I/O (D7).
+    /// Admissions subtract the bytes reserved since (in `reserved`), failing closed.
+    free_disk: AtomicU64,
+    hooks: Hooks,
+    /// The `objects/` directory, kept open from start-up: the `syncfs` observation handle
+    /// of D32, so writeback errors since start-up are reported to `close`.
+    objects_dir: StdFile,
     /// Held for the life of the process: the `flock` of D13.
-    _lock: std::fs::File,
+    _lock: StdFile,
+}
+
+/// An eviction decided under the index lock, to execute outside it.
+#[derive(Debug)]
+struct PendingDelete {
+    digest: Digest,
+    generation: u64,
+    charged: u64,
+    path: PathBuf,
 }
 
 /// Handle to the store. Cloning is cheap and every clone shares the same state.
@@ -287,6 +378,54 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
         .expect("blocking tasks are not cancelled while the runtime runs")
 }
 
+/// Runs `work` on the blocking pool, or on a fresh thread when no runtime is at hand (an
+/// admission from a plain thread must still be able to start a deletion).
+fn spawn_background(work: impl FnOnce() + Send + 'static) {
+    match Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn_blocking(work)),
+        Err(_) => drop(std::thread::spawn(work)),
+    }
+}
+
+/// [`spawn_background`], counted in `background` so [`Store::close`] can wait for it.
+fn spawn_tracked(inner: &Arc<Inner>, work: impl FnOnce() + Send + 'static) {
+    inner.background.fetch_add(1, Ordering::SeqCst);
+    let tracked = Arc::clone(inner);
+    spawn_background(move || {
+        work();
+        tracked.background.fetch_sub(1, Ordering::SeqCst);
+    });
+}
+
+fn digest_of(key: &Key) -> Digest {
+    Digest(*blake3::hash(key.as_str().as_bytes()).as_bytes())
+}
+
+/// `objects/<2 hex>/<64 hex>` for a digest. Every component is a plain name.
+fn object_path(root: &Path, digest: Digest) -> PathBuf {
+    let hex = blake3::Hash::from(digest.0).to_hex();
+    let hex = hex.as_str();
+    root.join("objects").join(&hex[..2]).join(hex)
+}
+
+/// Free bytes on the file system holding `path`, for the `min_free_disk` check. A failure
+/// reads as no free space: fail closed, never admit blind. Sampled off the request path.
+fn sample_free_disk(path: &Path) -> u64 {
+    match rustix::fs::statvfs(path) {
+        Ok(stats) => stats.f_bavail.saturating_mul(stats.f_frsize.max(1)),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "cannot read free disk space");
+            0
+        }
+    }
+}
+
+fn refresh_free_disk(inner: &Inner) {
+    inner
+        .free_disk
+        .store(sample_free_disk(&inner.root), Ordering::Release);
+}
+
 impl Store {
     /// Opens the store on `dir`, creating it if needed.
     ///
@@ -297,10 +436,12 @@ impl Store {
     pub(crate) async fn open(dir: &Path, options: Options) -> Result<Self, Error> {
         let dir = dir.to_path_buf();
         let inner = blocking(move || open_blocking(dir, options)).await?;
-        inner.ready.store(true, Ordering::Release);
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
+        let inner = Arc::new(inner);
+        // The scan rebuilds the index in the background (D14, D36): reads are served from
+        // disk meanwhile, admissions answer `not_ready`.
+        let scan = Arc::clone(&inner);
+        spawn_tracked(&inner, move || scan_blocking(&scan));
+        Ok(Self { inner })
     }
 
     /// Whether the index is built (`/healthz` answers 200, PUTs are admitted).
@@ -314,19 +455,49 @@ impl Store {
     ///
     /// [`Error::Io`] when the file exists but cannot be opened or inspected.
     pub(crate) async fn read(&self, key: &Key) -> Result<Option<Object>, Error> {
-        let path = self.inner.root.join(key.relative_path());
-        let file = match File::open(&path).await {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(Error::io("open", &path)(e)),
-        };
-        let meta = file.metadata().await.map_err(Error::io("stat", &path))?;
-        let modified = meta.modified().map_err(Error::io("stat", &path))?;
-        Ok(Some(Object {
-            file,
-            size: meta.len(),
-            modified,
-        }))
+        let digest = digest_of(key);
+        let path = object_path(&self.inner.root, digest);
+        // Two attempts: an eviction (or a rewrite) between the lookup and the open answers
+        // absent, or the newer version's bytes — never an error (D14).
+        for _attempt in 0..2 {
+            if self.is_ready() {
+                let hit = {
+                    let mut index = self.inner.index.lock().expect("index lock poisoned");
+                    index.hit(digest, SystemTime::now(), self.inner.options.touch_interval)
+                };
+                let Some(hit) = hit else { return Ok(None) };
+                if let Some(when) = hit.persist_recency {
+                    let inner = Arc::clone(&self.inner);
+                    let touch_path = path.clone();
+                    spawn_tracked(&self.inner, move || {
+                        touch(&inner, &touch_path, when);
+                    });
+                }
+                self.vanish_hook(&path);
+            }
+            match open_object(&path).await? {
+                Some(object) => return Ok(Some(object)),
+                None if !self.is_ready() => return Ok(None),
+                None => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Test hook: make the object file vanish (and optionally be replaced) after the index
+    /// lookup, as an eviction landing exactly then would.
+    fn vanish_hook(&self, path: &Path) {
+        match self.inner.hooks.vanish_on_read.swap(0, Ordering::SeqCst) {
+            0 => {}
+            1 => drop(std::fs::remove_file(path)),
+            2 => {
+                // Unlink for this attempt; the replacement lands before the retry, as a
+                // rewrite committing between the two opens would.
+                drop(std::fs::remove_file(path));
+                self.inner.hooks.vanish_on_read.store(3, Ordering::SeqCst);
+            }
+            _ => drop(std::fs::write(path, b"replacement")),
+        }
     }
 
     /// Size and modification time of the object of `key`, without opening it.
@@ -335,8 +506,17 @@ impl Store {
     ///
     /// [`Error::Io`] when the file exists but cannot be inspected.
     pub(crate) async fn stat(&self, key: &Key) -> Result<Option<Meta>, Error> {
-        let path = self.inner.root.join(key.relative_path());
-        match fs::metadata(&path).await {
+        let digest = digest_of(key);
+        if self.is_ready() {
+            // From the index, without I/O — and without refreshing recency: a `HEAD` probe
+            // is not a hit (D14 reserves that to reads).
+            let index = self.inner.index.lock().expect("index lock poisoned");
+            return Ok(index
+                .peek(digest)
+                .map(|(size, modified)| Meta { size, modified }));
+        }
+        let path = object_path(&self.inner.root, digest);
+        blocking(move || match std::fs::metadata(&path) {
             Ok(meta) => {
                 let modified = meta.modified().map_err(Error::io("stat", &path))?;
                 Ok(Some(Meta {
@@ -346,7 +526,8 @@ impl Store {
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::io("stat", &path)(e)),
-        }
+        })
+        .await
     }
 
     /// Decides, from the key and the announced size alone, whether a PUT is stored. Synchronous:
@@ -360,62 +541,330 @@ impl Store {
         if size > inner.options.max_object_size {
             return Admission::Dropped(DropReason::TooLarge);
         }
-        if !self.is_ready() {
+        if inner.closed.load(Ordering::Acquire) || !self.is_ready() {
             return Admission::Dropped(DropReason::NotReady);
         }
+        let digest = digest_of(key);
         let charged = charge(size);
-        let mut accounts = inner.accounts.lock().expect("accounts lock poisoned");
-        if accounts
-            .size
-            .saturating_add(accounts.reserved)
-            .saturating_add(charged)
-            > inner.options.max_size
+        let mut evictions: Vec<PendingDelete> = Vec::new();
+        let mut evicted_sizes: Vec<u64> = Vec::new();
         {
-            return Admission::Dropped(DropReason::NoSpace);
+            let mut index = inner.index.lock().expect("index lock poisoned");
+            let free = inner
+                .free_disk
+                .load(Ordering::Acquire)
+                .saturating_sub(index.reserved);
+            if free < inner.options.min_free_disk.saturating_add(charged) {
+                return Admission::Dropped(DropReason::NoSpace);
+            }
+            // The bytes this admission must free. Its own evictions move from `size` to
+            // `pending` and are spent by this reservation; `pending` from earlier
+            // admissions stays charged until its unlinks land, so no later admission can
+            // spend the same bytes twice.
+            let over = index
+                .charged_total()
+                .saturating_add(charged)
+                .saturating_sub(inner.options.max_size);
+            if over > 0 {
+                // Collect first: an admission that cannot fit evicts nothing (D12).
+                index.pin(digest);
+                let candidates = index.eviction_candidates(over);
+                let mut freed = 0_u64;
+                let mut chosen: Vec<Digest> = Vec::new();
+                for candidate in candidates {
+                    if freed >= over {
+                        break;
+                    }
+                    if let Some((_, candidate_charged)) =
+                        index.peek(candidate).map(|(size, _)| (size, charge(size)))
+                    {
+                        freed = freed.saturating_add(candidate_charged);
+                        chosen.push(candidate);
+                    }
+                }
+                if freed < over {
+                    index.unpin(digest);
+                    return Admission::Dropped(DropReason::NoSpace);
+                }
+                for candidate in chosen {
+                    if let Some(entry) = index.remove(candidate) {
+                        index.pending = index.pending.saturating_add(entry.charged);
+                        evicted_sizes.push(entry.size);
+                        evictions.push(PendingDelete {
+                            digest: entry.digest,
+                            generation: entry.generation,
+                            charged: entry.charged,
+                            path: object_path(&inner.root, entry.digest),
+                        });
+                    }
+                }
+            } else {
+                index.pin(digest);
+            }
+            index.reserved = index.reserved.saturating_add(charged);
         }
-        accounts.reserved += charged;
-        drop(accounts);
+        for (pending, evicted) in evictions.into_iter().zip(evicted_sizes) {
+            inner.options.metrics.eviction(evicted);
+            let delete_inner = Arc::clone(inner);
+            spawn_tracked(inner, move || delete_pending(&delete_inner, &pending));
+        }
         Admission::Reserved(Reservation {
             inner: Arc::clone(inner),
-            destination: inner.root.join(key.relative_path()),
+            digest,
+            destination: object_path(&inner.root, digest),
             size,
             charged,
-            temporary: None,
             settled: false,
         })
     }
 
     /// The counters behind the gauges.
     pub(crate) fn stats(&self) -> Stats {
-        let accounts = self.inner.accounts.lock().expect("accounts lock poisoned");
+        let index = self.inner.index.lock().expect("index lock poisoned");
         Stats {
-            size_bytes: accounts.size,
+            size_bytes: index.size,
             size_limit_bytes: self.inner.options.max_size,
-            entries: accounts.entries,
-            oldest_entry_age: None,
+            entries: index.entries(),
+            oldest_entry_age: index
+                .oldest_access()
+                .and_then(|access| SystemTime::now().duration_since(access).ok()),
         }
     }
 
     /// Flushes what shutdown must persist (late recency updates). Call once the server drained.
     ///
+    /// Closes admissions, waits for every writer and background task, persists late
+    /// recency, then — `purge-on-crash` only — runs a checked `syncfs` before writing
+    /// `clean = true` (D32). There is no deadline here by design: the server's shutdown
+    /// deadline killing the process before this returns leaves `clean = false`, which is
+    /// exactly the "missed deadline forbids clean" rule.
+    ///
     /// # Errors
     ///
-    /// [`Error::Io`] when a flush fails.
-    #[expect(
-        clippy::unused_async,
-        clippy::unused_async_trait_impl,
-        reason = "nothing to flush without recency"
-    )]
+    /// [`Error::Io`] when a flush fails. The state stays `clean = false`.
     pub(crate) async fn close(&self) -> Result<(), Error> {
-        Ok(())
+        let inner = Arc::clone(&self.inner);
+        inner.closed.store(true, Ordering::Release);
+        blocking(move || close_blocking(&inner)).await
     }
+}
+
+/// Opens an object file and its metadata on the blocking pool. `Ok(None)` is `ENOENT`.
+async fn open_object(path: &Path) -> Result<Option<Object>, Error> {
+    let path = path.to_path_buf();
+    blocking(move || match StdFile::open(&path) {
+        Ok(file) => {
+            let meta = file.metadata().map_err(Error::io("stat", &path))?;
+            let modified = meta.modified().map_err(Error::io("stat", &path))?;
+            Ok(Some(Object {
+                file: File::from_std(file),
+                size: meta.len(),
+                modified,
+            }))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io("open", &path)(e)),
+    })
+    .await
+}
+
+/// Sets a file's `mtime` to `when` (the persisted recency, D14). Background task body.
+fn touch(inner: &Inner, path: &Path, when: SystemTime) {
+    let _ = inner;
+    match StdFile::options().write(true).open(path) {
+        Ok(file) => {
+            if let Err(e) = file.set_modified(when) {
+                warn!(path = %path.display(), error = %e, "cannot persist recency");
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => warn!(path = %path.display(), error = %e, "cannot persist recency"),
+    }
+}
+
+/// Deletes one evicted object, unless a newer version was committed after the eviction
+/// was decided. The validation lock makes the generation check and the unlink atomic
+/// against a commit's rename.
+fn delete_pending(inner: &Arc<Inner>, pending: &PendingDelete) {
+    while inner.hooks.hold_deletions.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    {
+        let _validation = inner.validation.lock().expect("validation lock poisoned");
+        let stale = {
+            let index = inner.index.lock().expect("index lock poisoned");
+            matches!(index.generation(pending.digest), Some(g) if g != pending.generation)
+        };
+        if !stale {
+            match std::fs::remove_file(&pending.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(path = %pending.path.display(), error = %e, "cannot delete evicted object");
+                }
+            }
+        }
+    }
+    let mut index = inner.index.lock().expect("index lock poisoned");
+    index.pending = index.pending.saturating_sub(pending.charged);
+    drop(index);
+    refresh_free_disk(inner);
+}
+
+/// The persisted run state of D32: the durability mode of the run that wrote it, and
+/// whether that run shut down cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct State {
+    mode: Durability,
+    clean: bool,
+}
+
+fn mode_name(mode: Durability) -> &'static str {
+    match mode {
+        Durability::PurgeOnCrash => "purge-on-crash",
+        Durability::Fsync => "fsync",
+    }
+}
+
+/// Reads `state`; absent, unreadable and malformed all read as `None` (each purges, D32).
+/// The second value says whether a state file exists at all: a first boot on an empty
+/// directory purges nothing and is initialisation, not a crash purge.
+fn read_state(root: &Path) -> (Option<State>, bool) {
+    let path = root.join("state");
+    let existed = path.try_exists().unwrap_or(false);
+    (parse_state(&path), existed)
+}
+
+fn parse_state(path: &Path) -> Option<State> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut mode = None;
+    let mut clean = None;
+    for line in text.lines() {
+        let (field, value) = line.split_once('=')?;
+        match (field.trim(), value.trim()) {
+            ("mode", "purge-on-crash") => mode = Some(Durability::PurgeOnCrash),
+            ("mode", "fsync") => mode = Some(Durability::Fsync),
+            ("clean", "true") => clean = Some(true),
+            ("clean", "false") => clean = Some(false),
+            _ => return None,
+        }
+    }
+    Some(State {
+        mode: mode?,
+        clean: clean?,
+    })
+}
+
+/// Whether the previous run's objects may be served. Only a readable state that is clean,
+/// or unclean in `fsync` mode (whose objects are each synced), keeps them.
+fn purge_needed(previous: Option<State>) -> bool {
+    match previous {
+        None => true,
+        Some(state) => !state.clean && state.mode == Durability::PurgeOnCrash,
+    }
+}
+
+/// Writes `state` via a synced temporary plus rename, then syncs the directory, so a crash
+/// leaves the old state or the new one, never a torn one.
+fn write_state(root: &Path, state: State) -> Result<(), Error> {
+    let temporary = root.join("state.tmp");
+    let destination = root.join("state");
+    {
+        let mut file = StdFile::create(&temporary).map_err(Error::io("create", &temporary))?;
+        write!(
+            file,
+            "mode={}\nclean={}\n",
+            mode_name(state.mode),
+            state.clean
+        )
+        .map_err(Error::io("write", &temporary))?;
+        file.sync_all().map_err(Error::io("fsync", &temporary))?;
+    }
+    std::fs::rename(&temporary, &destination).map_err(Error::io("rename", &destination))?;
+    sync_dir(root)
+}
+
+fn sync_dir(dir: &Path) -> Result<(), Error> {
+    StdFile::open(dir)
+        .and_then(|file| file.sync_all())
+        .map_err(Error::io("fsync", dir))
+}
+
+/// Deletes every object file, shard by shard, returning how many. Names outside the
+/// object scheme are left alone here too: a purge removes what the store could have
+/// served, nothing else.
+fn purge_objects(objects: &Path) -> Result<u64, Error> {
+    let mut removed = 0_u64;
+    for shard in shard_dirs(objects)? {
+        let read = std::fs::read_dir(&shard).map_err(Error::io("read", &shard))?;
+        for entry in read {
+            let entry = entry.map_err(Error::io("read", &shard))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if parse_digest(name).is_some() {
+                let path = entry.path();
+                std::fs::remove_file(&path).map_err(Error::io("delete", &path))?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// The existing `objects/<2 hex>` directories. Anything else directly under `objects/` is
+/// unexpected: logged, ignored, never deleted.
+fn shard_dirs(objects: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut shards = Vec::new();
+    let read = match std::fs::read_dir(objects) {
+        Ok(read) => read,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(shards),
+        Err(e) => return Err(Error::io("read", objects)(e)),
+    };
+    for entry in read {
+        let entry = entry.map_err(Error::io("read", objects))?;
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .map_err(Error::io("stat", &path))?
+            .is_dir();
+        let name = entry.file_name();
+        let valid = name.to_str().is_some_and(is_shard_name);
+        if is_dir && valid {
+            shards.push(path);
+        } else {
+            warn!(path = %path.display(), "unexpected entry under objects/, ignored");
+        }
+    }
+    Ok(shards)
+}
+
+fn is_shard_name(name: &str) -> bool {
+    name.len() == 2
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn parse_digest(name: &str) -> Option<Digest> {
+    if name.len() != 64 {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in digest.iter_mut().enumerate() {
+        *pair = u8::from_str_radix(name.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    // blake3 hex is lowercase; uppercase names are not ours.
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    Some(Digest(digest))
 }
 
 fn open_blocking(root: PathBuf, options: Options) -> Result<Inner, Error> {
     let objects = root.join("objects");
     std::fs::create_dir_all(&objects).map_err(Error::io("create", &objects))?;
     let lock_path = root.join("lock");
-    let lock = std::fs::File::options()
+    let lock = StdFile::options()
         .create(true)
         .truncate(false)
         .write(true)
@@ -426,6 +875,34 @@ fn open_blocking(root: PathBuf, options: Options) -> Result<Inner, Error> {
         Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Locked(root)),
         Err(std::fs::TryLockError::Error(e)) => return Err(Error::io("lock", &lock_path)(e)),
     }
+    // D32, under the flock and before any mutation or served read. While a purge runs, the
+    // state on disk still demands one (`purge-on-crash`, not clean), so an interrupted
+    // purge starts over at the next start instead of serving what it had not reached.
+    let (previous, state_existed) = read_state(&root);
+    if purge_needed(previous) {
+        write_state(
+            &root,
+            State {
+                mode: Durability::PurgeOnCrash,
+                clean: false,
+            },
+        )?;
+        let removed = purge_objects(&objects)?;
+        if removed > 0 || state_existed {
+            options.metrics.crash_purge();
+            warn!(
+                removed,
+                "purged all objects: the previous run was not clean"
+            );
+        }
+    }
+    write_state(
+        &root,
+        State {
+            mode: options.durability,
+            clean: false,
+        },
+    )?;
     let tmp = root.join("tmp");
     match std::fs::remove_dir_all(&tmp) {
         Ok(()) => {}
@@ -433,57 +910,267 @@ fn open_blocking(root: PathBuf, options: Options) -> Result<Inner, Error> {
         Err(e) => return Err(Error::io("clear", &tmp)(e)),
     }
     std::fs::create_dir_all(&tmp).map_err(Error::io("create", &tmp))?;
-    let accounts = scan(&objects)?;
+    let objects_dir = StdFile::open(&objects).map_err(Error::io("open", &objects))?;
+    let free_disk = sample_free_disk(&root);
     Ok(Inner {
         root,
         options,
-        accounts: Mutex::new(accounts),
+        index: Mutex::new(Index::with_capacity(0)),
         validation: Mutex::new(()),
         ready: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
         next_tmp: AtomicU64::new(0),
+        background: AtomicU64::new(0),
+        free_disk: AtomicU64::new(free_disk),
+        hooks: Hooks::default(),
+        objects_dir,
         _lock: lock,
     })
 }
 
-fn scan(objects: &Path) -> Result<Accounts, Error> {
-    let mut accounts = Accounts::default();
-    let read_dir = |dir: &Path| std::fs::read_dir(dir).map_err(Error::io("read", dir));
-    for bucket in read_dir(objects)? {
-        let bucket = bucket.map_err(Error::io("read", objects))?;
-        if !bucket
-            .file_type()
-            .map_err(Error::io("stat", &bucket.path()))?
-            .is_dir()
-        {
+/// One object found by the start-up scan.
+#[derive(Debug)]
+struct Scanned {
+    digest: Digest,
+    size: u64,
+    modified: SystemTime,
+}
+
+fn scan_shard(shard: &Path, out: &mut Vec<Scanned>) -> Result<(), Error> {
+    let shard_name = shard
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let read = std::fs::read_dir(shard).map_err(Error::io("read", shard))?;
+    for entry in read {
+        let entry = entry.map_err(Error::io("read", shard))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            warn!(path = %path.display(), "unexpected entry under objects/, ignored");
+            continue;
+        };
+        let Some(digest) = parse_digest(name) else {
+            warn!(path = %path.display(), "unexpected entry under objects/, ignored");
+            continue;
+        };
+        if !name.starts_with(&shard_name) {
+            warn!(path = %path.display(), "unexpected entry under objects/, ignored");
             continue;
         }
-        for entry in read_dir(&bucket.path())? {
-            let entry = entry.map_err(Error::io("read", &bucket.path()))?;
-            let meta = entry.metadata().map_err(Error::io("stat", &entry.path()))?;
-            if meta.is_file() {
-                accounts.size = accounts.size.saturating_add(charge(meta.len()));
-                accounts.entries += 1;
+        let meta = entry.metadata().map_err(Error::io("stat", &path))?;
+        if !meta.is_file() {
+            warn!(path = %path.display(), "unexpected entry under objects/, ignored");
+            continue;
+        }
+        let modified = meta.modified().map_err(Error::io("stat", &path))?;
+        out.push(Scanned {
+            digest,
+            size: meta.len(),
+            modified,
+        });
+    }
+    Ok(())
+}
+
+/// Rebuilds the index from `objects/` (D36): shards scanned in parallel with local
+/// accumulation, one sort by `mtime`, the map built at exact capacity. Objects above
+/// `max_size` (a shrunk configuration) are evicted, oldest first, before readiness.
+/// Test gate: while set, start-up scans wait, opening the `not_ready` window (D14).
+#[cfg(test)]
+static HOLD_SCAN: AtomicBool = AtomicBool::new(false);
+
+fn scan_blocking(inner: &Arc<Inner>) {
+    while inner.hooks.hold_scan.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    #[cfg(test)]
+    while HOLD_SCAN.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let objects = inner.root.join("objects");
+    let shards = match shard_dirs(&objects) {
+        Ok(shards) => shards,
+        Err(e) => {
+            error!(error = %e, "start-up scan failed; the store stays not ready");
+            return;
+        }
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .clamp(1, 8);
+    let scanned: Option<Vec<Scanned>> = std::thread::scope(|scope| {
+        let chunks: Vec<&[PathBuf]> = shards
+            .chunks(shards.len().div_ceil(workers).max(1))
+            .collect();
+        let mut handles = Vec::new();
+        for chunk in chunks {
+            handles.push(scope.spawn(move || {
+                let mut local = Vec::new();
+                let mut failure = None;
+                for shard in chunk {
+                    if let Err(e) = scan_shard(shard, &mut local) {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+                (local, failure)
+            }));
+        }
+        let mut all = Vec::new();
+        for handle in handles {
+            let (local, failure) = handle.join().unwrap_or_else(|_| (Vec::new(), None));
+            if let Some(e) = failure {
+                error!(error = %e, "start-up scan failed; the store stays not ready");
+                return None;
+            }
+            all.extend(local);
+        }
+        Some(all)
+    });
+    let Some(mut scanned) = scanned else { return };
+    // Deterministic order for equal mtimes: by digest. Oldest first.
+    scanned.sort_by(|a, b| {
+        a.modified
+            .cmp(&b.modified)
+            .then(a.digest.0.cmp(&b.digest.0))
+    });
+    let mut evictions: Vec<PendingDelete> = Vec::new();
+    let mut evicted_sizes: Vec<u64> = Vec::new();
+    {
+        let mut index = Index::with_capacity(scanned.len());
+        for object in &scanned {
+            index.commit(
+                object.digest,
+                object.size,
+                charge(object.size),
+                object.modified,
+            );
+        }
+        // The fit measure here is the committed size: entries decided here move to
+        // `pending`, which bounds later admissions until their unlinks land.
+        while index.size > inner.options.max_size {
+            let over = index.size - inner.options.max_size;
+            let candidates = index.eviction_candidates(over);
+            if candidates.is_empty() {
+                break;
+            }
+            for candidate in candidates {
+                if let Some(entry) = index.remove(candidate) {
+                    index.pending = index.pending.saturating_add(entry.charged);
+                    evicted_sizes.push(entry.size);
+                    evictions.push(PendingDelete {
+                        digest: entry.digest,
+                        generation: entry.generation,
+                        charged: entry.charged,
+                        path: object_path(&inner.root, entry.digest),
+                    });
+                }
             }
         }
+        *inner.index.lock().expect("index lock poisoned") = index;
+        inner.ready.store(true, Ordering::Release);
     }
-    Ok(accounts)
+    for (pending, evicted) in evictions.into_iter().zip(evicted_sizes) {
+        inner.options.metrics.eviction(evicted);
+        let delete_inner = Arc::clone(inner);
+        spawn_tracked(inner, move || delete_pending(&delete_inner, &pending));
+    }
+    refresh_free_disk(inner);
+}
+
+fn close_blocking(inner: &Arc<Inner>) -> Result<(), Error> {
+    // Writers and background tasks must all be done; spawning none from here on (the late
+    // touches below run inline, not as background tasks).
+    while inner.background.load(Ordering::Acquire) > 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let late = {
+        let mut index = inner.index.lock().expect("index lock poisoned");
+        index.take_late_touches()
+    };
+    for (digest, when) in late {
+        touch(inner, &object_path(&inner.root, digest), when);
+    }
+    if inner.options.durability == Durability::PurgeOnCrash {
+        syncfs_checked(inner)?;
+    }
+    write_state(
+        &inner.root,
+        State {
+            mode: inner.options.durability,
+            clean: true,
+        },
+    )
+}
+
+/// `syncfs` on the objects' file system, success checked (D32). Linux only: elsewhere a
+/// `purge-on-crash` run can never be certified clean, so close fails and the next start
+/// purges — the configuration already refuses the mode off Linux.
+fn syncfs_checked(inner: &Inner) -> Result<(), Error> {
+    let objects = inner.root.join("objects");
+    if inner.hooks.fail_syncfs.load(Ordering::Acquire) {
+        return Err(Error::io("syncfs", &objects)(io::Error::other(
+            "injected syncfs failure",
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        rustix::fs::syncfs(&inner.objects_dir)
+            .map_err(io::Error::from)
+            .map_err(Error::io("syncfs", &objects))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(Error::io("syncfs", &objects)(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "syncfs is not available on this platform",
+        )))
+    }
 }
 
 /// Room reserved for one PUT, from admission to its end. Dropping it without a stored object
-/// gives the room back and removes the temporary file.
+/// gives the room back.
 #[derive(Debug)]
 pub(crate) struct Reservation {
     inner: Arc<Inner>,
+    digest: Digest,
     destination: PathBuf,
     size: u64,
     charged: u64,
-    temporary: Option<PathBuf>,
+    /// True once the writer task owns settling (inside [`Reservation::write`]), or the
+    /// object is stored. An unsettled reservation is cancelled by `Drop`.
     settled: bool,
 }
 
-enum Failure {
+/// One message to a write's blocking task (D34).
+enum WriteMsg {
+    Chunk(Bytes),
+    /// The body stream failed; abandon the write.
+    Abort,
+}
+
+/// How a writer task ended.
+enum WriteResult {
+    Stored,
     Aborted,
     Io(Error),
+}
+
+/// Gives a reservation's room back and unpins its key.
+fn release_reservation(inner: &Inner, digest: Digest, charged: u64) {
+    let mut index = inner.index.lock().expect("index lock poisoned");
+    index.reserved = index.reserved.saturating_sub(charged);
+    index.unpin(digest);
+}
+
+fn remove_temporary(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => warn!(path = %path.display(), error = %e, "cannot remove temporary file"),
+    }
 }
 
 impl Reservation {
@@ -497,143 +1184,156 @@ impl Reservation {
     where
         S: Stream<Item = Result<Bytes, E>>,
     {
+        // From here the writer task owns settling the reservation on every path,
+        // including this future being dropped (its channel then closes early).
+        self.settled = true;
+        let (sender, receiver) = mpsc::channel(WRITE_CHANNEL_DEPTH);
+        let (result_sender, result_receiver) = oneshot::channel();
+        let inner = Arc::clone(&self.inner);
+        let (digest, destination, size, charged) = (
+            self.digest,
+            self.destination.clone(),
+            self.size,
+            self.charged,
+        );
+        spawn_tracked(&self.inner, move || {
+            let result = writer_blocking(&inner, receiver, digest, &destination, size, charged);
+            drop(result_sender.send(result));
+        });
         let mut body = pin!(body);
-        match self.receive(body.as_mut()).await {
-            Ok(()) => {}
-            Err(Failure::Aborted) => return Outcome::Aborted,
-            Err(Failure::Io(e)) => {
-                error!(error = %e, "PUT dropped after admission");
-                while let Some(Ok(_)) = body.next().await {}
-                return Outcome::Dropped(DropReason::Io);
+        let mut writer_gone = false;
+        while let Some(chunk) = body.next().await {
+            let Ok(chunk) = chunk else {
+                drop(sender.send(WriteMsg::Abort).await);
+                break;
+            };
+            if sender.send(WriteMsg::Chunk(chunk)).await.is_err() {
+                writer_gone = true;
+                break;
             }
         }
-        match self.commit().await {
-            Ok(()) => Outcome::Stored,
-            Err(e) => {
+        drop(sender);
+        match result_receiver.await {
+            Ok(WriteResult::Stored) => Outcome::Stored,
+            Ok(WriteResult::Aborted) => Outcome::Aborted,
+            Ok(WriteResult::Io(e)) => {
                 error!(error = %e, "PUT dropped after admission");
+                if writer_gone {
+                    while let Some(Ok(_)) = body.next().await {}
+                }
+                Outcome::Dropped(DropReason::Io)
+            }
+            Err(_) => {
+                error!("writer task ended without a result");
                 Outcome::Dropped(DropReason::Io)
             }
         }
     }
-
-    async fn receive<S, E>(&mut self, mut body: std::pin::Pin<&mut S>) -> Result<(), Failure>
-    where
-        S: Stream<Item = Result<Bytes, E>>,
-    {
-        let id = self.inner.next_tmp.fetch_add(1, Ordering::Relaxed);
-        let path = self.inner.root.join("tmp").join(id.to_string());
-        let mut file = File::create(&path)
-            .await
-            .map_err(Error::io("create", &path))
-            .map_err(Failure::Io)?;
-        self.temporary = Some(path.clone());
-        let mut received = 0_u64;
-        while let Some(chunk) = body.next().await {
-            let Ok(chunk) = chunk else {
-                return Err(Failure::Aborted);
-            };
-            received = received.saturating_add(len_u64(&chunk));
-            if received > self.size {
-                return Err(Failure::Aborted);
-            }
-            file.write_all(&chunk)
-                .await
-                .map_err(Error::io("write", &path))
-                .map_err(Failure::Io)?;
-        }
-        if received != self.size {
-            return Err(Failure::Aborted);
-        }
-        file.flush()
-            .await
-            .map_err(Error::io("write", &path))
-            .map_err(Failure::Io)?;
-        if self.inner.options.durability == Durability::Fsync {
-            file.sync_all()
-                .await
-                .map_err(Error::io("fsync", &path))
-                .map_err(Failure::Io)?;
-        }
-        Ok(())
-    }
-
-    async fn commit(&mut self) -> Result<(), Error> {
-        let temporary = self
-            .temporary
-            .clone()
-            .expect("receive created the temporary file");
-        let destination = self.destination.clone();
-        let inner = Arc::clone(&self.inner);
-        let charged = self.charged;
-        blocking(move || commit_blocking(&inner, &temporary, &destination, charged)).await?;
-        self.temporary = None;
-        self.settled = true;
-        self.inner.options.metrics.written_bytes(self.size);
-        Ok(())
-    }
 }
 
-/// Moves the temporary file into place and updates the totals.
-///
-/// The reservation stays charged until the rename is done. Validations take `validation` for the
-/// lookup of the replaced version and the rename, so totals stay exact when two writers race on
-/// one key; `accounts` is taken afterwards, only for the O(1) update, so an admission never waits
-/// for the disk. The disk store replaces this with its index.
-fn commit_blocking(
-    inner: &Inner,
-    temporary: &Path,
+/// The write's one blocking task (D34): owns the temporary file, writes through a
+/// [`WRITE_BUFFER`] `BufWriter`, then validates in the same task.
+fn writer_blocking(
+    inner: &Arc<Inner>,
+    mut receiver: mpsc::Receiver<WriteMsg>,
+    digest: Digest,
     destination: &Path,
+    size: u64,
     charged: u64,
-) -> Result<(), Error> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| Error::io("commit", destination)(io::ErrorKind::InvalidInput.into()))?;
-    std::fs::create_dir_all(parent).map_err(Error::io("create", parent))?;
-    let _validation = inner.validation.lock().expect("validation lock poisoned");
-    let replaced = match std::fs::metadata(destination) {
-        Ok(meta) => Some(charge(meta.len())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(Error::io("stat", destination)(e)),
+) -> WriteResult {
+    let id = inner.next_tmp.fetch_add(1, Ordering::Relaxed);
+    let temporary = inner
+        .root
+        .join("tmp")
+        .join(format!("{}-{id}", std::process::id()));
+    let file = match StdFile::create(&temporary) {
+        Ok(file) => file,
+        Err(e) => {
+            release_reservation(inner, digest, charged);
+            return WriteResult::Io(Error::io("create", &temporary)(e));
+        }
     };
-    std::fs::rename(temporary, destination).map_err(Error::io("rename", destination))?;
-    let mut accounts = inner.accounts.lock().expect("accounts lock poisoned");
-    accounts.reserved = accounts.reserved.saturating_sub(charged);
-    accounts.size = accounts
-        .size
-        .saturating_sub(replaced.unwrap_or(0))
-        .saturating_add(charged);
-    if replaced.is_none() {
-        accounts.entries += 1;
+    let abandon = |result: WriteResult| -> WriteResult {
+        remove_temporary(&temporary);
+        release_reservation(inner, digest, charged);
+        result
+    };
+    let mut writer = BufWriter::with_capacity(WRITE_BUFFER, file);
+    let mut bytes_seen = 0_u64;
+    loop {
+        match receiver.blocking_recv() {
+            Some(WriteMsg::Chunk(chunk)) => {
+                bytes_seen = bytes_seen.saturating_add(len_u64(&chunk));
+                if bytes_seen > size {
+                    return abandon(WriteResult::Aborted);
+                }
+                if let Err(e) = writer.write_all(&chunk) {
+                    return abandon(WriteResult::Io(Error::io("write", &temporary)(e)));
+                }
+            }
+            Some(WriteMsg::Abort) => return abandon(WriteResult::Aborted),
+            None => break,
+        }
     }
-    Ok(())
+    if bytes_seen != size {
+        return abandon(WriteResult::Aborted);
+    }
+    if let Err(e) = writer.flush() {
+        return abandon(WriteResult::Io(Error::io("write", &temporary)(e)));
+    }
+    if inner.options.durability == Durability::Fsync
+        && let Err(e) = writer.get_ref().sync_all()
+    {
+        return abandon(WriteResult::Io(Error::io("fsync", &temporary)(e)));
+    }
+    drop(writer);
+    // The parent is created before the validation lock, so a validation stuck in I/O is
+    // observable (and admissions never wait for either).
+    if let Some(parent) = destination.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return abandon(WriteResult::Io(Error::io("create", parent)(e)));
+    }
+    let modified = {
+        let _validation = inner.validation.lock().expect("validation lock poisoned");
+        if let Err(e) = std::fs::rename(&temporary, destination) {
+            return abandon(WriteResult::Io(Error::io("rename", destination)(e)));
+        }
+        // The rename already made the object visible: a failed stat must not lose it.
+        std::fs::metadata(destination)
+            .and_then(|meta| meta.modified())
+            .unwrap_or_else(|_| SystemTime::now())
+    };
+    // The object is visible on disk; the index catches up here, still holding the
+    // reservation until this O(1) section converts it into the stored entry.
+    {
+        let mut index = inner.index.lock().expect("index lock poisoned");
+        index.commit(digest, size, charged, modified);
+        index.reserved = index.reserved.saturating_sub(charged);
+        index.unpin(digest);
+    }
+    inner.options.metrics.written_bytes(size);
+    refresh_free_disk(inner);
+    WriteResult::Stored
 }
 
 impl Drop for Reservation {
-    /// Cancels an unsettled reservation. The temporary file is removed on the blocking pool, and
-    /// the room stays charged until it is gone, so the bound of D12 holds meanwhile.
+    /// Cancels an unsettled reservation (one [`Reservation::write`] never took): no file
+    /// exists yet, only the room and the pin are held. The release is handed to the
+    /// blocking pool and the room stays charged until it runs, so D12 holds meanwhile and
+    /// the dropping thread never does the store's bookkeeping synchronously (P3). Without
+    /// a runtime there is nowhere to hand it to; the O(1) release runs inline, file-free.
     fn drop(&mut self) {
         if self.settled {
             return;
         }
         let inner = Arc::clone(&self.inner);
-        let temporary = self.temporary.take();
-        let charged = self.charged;
-        let cancel = move || {
-            if let Some(path) = temporary {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        warn!(path = %path.display(), error = %e, "cannot remove temporary file");
-                    }
-                }
-            }
-            let mut accounts = inner.accounts.lock().expect("accounts lock poisoned");
-            accounts.reserved = accounts.reserved.saturating_sub(charged);
-        };
+        let (digest, charged) = (self.digest, self.charged);
         match Handle::try_current() {
-            Ok(runtime) => drop(runtime.spawn_blocking(cancel)),
-            Err(_) => cancel(),
+            Ok(_) => spawn_tracked(&self.inner, move || {
+                release_reservation(&inner, digest, charged);
+            }),
+            Err(_) => release_reservation(&inner, digest, charged),
         }
     }
 }
@@ -678,7 +1378,28 @@ mod tests {
         value
     }
 
+    /// Waits for the background start-up scan to make the store ready.
+    async fn ready(store: &Store) {
+        eventually("store readiness", || store.is_ready()).await;
+    }
+
+    /// Reopens after a drop; the previous store's last background task may hold the
+    /// `flock` for a moment after the handle is gone.
+    async fn open_retried(dir: &Path, opts: Options) -> Store {
+        for _ in 0..200 {
+            match Store::open(dir, opts.clone()).await {
+                Ok(store) => return store,
+                Err(Error::Locked(_)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("open failed: {e}"),
+            }
+        }
+        panic!("store stayed locked for 2s");
+    }
+
     async fn put(store: &Store, key: &Key, data: &'static [u8]) -> Outcome {
+        ready(store).await;
         let size = u64::try_from(data.len()).unwrap();
         match store.admit(key, size) {
             // The write future must be Send: http awaits it inside axum handlers.
@@ -716,6 +1437,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path(), options(MIB)).await.unwrap();
         let k = key("a/b/c");
+        ready(&store).await;
         assert!(store.is_ready());
         assert!(contents(&store, &k).await.is_none());
         assert_eq!(put(&store, &k, b"hello cache").await, Outcome::Stored);
@@ -751,10 +1473,11 @@ mod tests {
         for raw in ["", "/", "/a/../b", "/a/./b", "/a%00b", "/%ff"] {
             assert!(Key::from_uri_path(raw).is_err(), "{raw:?} was accepted");
         }
-        let files: Vec<_> = walk(dir.path());
+        let mut files: Vec<_> = walk(dir.path());
+        files.sort();
         assert_eq!(
             files,
-            [dir.path().join("lock")],
+            [dir.path().join("lock"), dir.path().join("state")],
             "unexpected files: {files:?}"
         );
     }
@@ -778,6 +1501,7 @@ mod tests {
         let mut opts = options(2 * BLOCK);
         opts.max_object_size = BLOCK;
         let store = Store::open(dir.path(), opts).await.unwrap();
+        ready(&store).await;
         let k = key("k");
         assert!(matches!(
             store.admit(&k, BLOCK + 1),
@@ -802,6 +1526,7 @@ mod tests {
     async fn dropped_reservation_cleans_up() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path(), options(BLOCK)).await.unwrap();
+        ready(&store).await;
         let k = key("k");
         let Admission::Reserved(reservation) = store.admit(&k, 4) else {
             panic!("not admitted")
@@ -824,6 +1549,7 @@ mod tests {
     async fn cancelled_write_keeps_its_room_until_cleanup_is_done() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path(), options(BLOCK)).await.unwrap();
+        ready(&store).await;
         let Admission::Reserved(reservation) = store.admit(&key("k"), 4) else {
             panic!("not admitted")
         };
@@ -875,6 +1601,7 @@ mod tests {
     async fn short_and_failed_bodies_store_nothing() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        ready(&store).await;
         let k = key("k");
         let Admission::Reserved(reservation) = store.admit(&k, 10) else {
             panic!("not admitted")
@@ -894,6 +1621,7 @@ mod tests {
     async fn io_error_drains_the_body_and_gives_the_room_back() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        ready(&store).await;
         let k = key("k");
         let Admission::Reserved(reservation) = store.admit(&k, 4) else {
             panic!("not admitted")
@@ -918,6 +1646,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eviction_lru_makes_room() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(2 * BLOCK)).await.unwrap();
+        assert_eq!(put(&store, &key("a"), b"aaaa").await, Outcome::Stored);
+        assert_eq!(put(&store, &key("b"), b"bbbb").await, Outcome::Stored);
+        // Reading `a` makes `b` the least recently used; `c` must evict `b`.
+        assert!(contents(&store, &key("a")).await.is_some());
+        assert_eq!(put(&store, &key("c"), b"cccc").await, Outcome::Stored);
+        assert!(contents(&store, &key("a")).await.is_some(), "a evicted");
+        assert!(contents(&store, &key("b")).await.is_none(), "b not evicted");
+        assert!(contents(&store, &key("c")).await.is_some(), "c missing");
+    }
+
+    #[tokio::test]
+    async fn min_free_disk_refuses() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = options(MIB);
+        opts.min_free_disk = u64::MAX / 2;
+        let store = Store::open(dir.path(), opts).await.unwrap();
+        ready(&store).await;
+        assert!(matches!(
+            store.admit(&key("k"), 4),
+            Admission::Dropped(DropReason::NoSpace)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unclean_purge_on_crash_state_purges() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = options(MIB);
+        opts.durability = Durability::PurgeOnCrash;
+        let store = Store::open(dir.path(), opts.clone()).await.unwrap();
+        assert_eq!(put(&store, &key("k"), b"data").await, Outcome::Stored);
+        drop(store); // No close(): an unclean purge-on-crash run.
+        let reopened = open_retried(dir.path(), opts).await;
+        assert!(
+            contents(&reopened, &key("k")).await.is_none(),
+            "object of an unclean purge-on-crash run was served"
+        );
+    }
+
+    #[tokio::test]
     async fn survives_a_restart_and_refuses_a_second_opener() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path(), options(MIB)).await.unwrap();
@@ -928,8 +1698,658 @@ mod tests {
             Err(Error::Locked(_))
         ));
         drop(store);
-        let reopened = Store::open(dir.path(), options(MIB)).await.unwrap();
+        let reopened = open_retried(dir.path(), options(MIB)).await;
         assert_eq!(contents(&reopened, &k).await.as_deref(), Some(&b"data"[..]));
+        ready(&reopened).await;
         assert_eq!(reopened.stats().entries, 1);
+    }
+
+    async fn put_vec(store: &Store, key: &Key, data: Vec<u8>) -> Outcome {
+        ready(store).await;
+        let size = u64::try_from(data.len()).unwrap();
+        match store.admit(key, size) {
+            Admission::Reserved(reservation) => {
+                let body = stream::iter([Ok::<_, Infallible>(Bytes::from(data))]);
+                reservation.write(body).await
+            }
+            Admission::Dropped(reason) => Outcome::Dropped(reason),
+        }
+    }
+
+    /// Charged bytes of every file under `objects/` and `tmp/`: the D12 disk measure.
+    fn disk_charged(dir: &Path) -> u64 {
+        let mut total = 0_u64;
+        for sub in ["objects", "tmp"] {
+            for path in walk(&dir.join(sub)) {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    total = total.saturating_add(charge(meta.len()));
+                }
+            }
+        }
+        total
+    }
+
+    fn object_files(dir: &Path) -> usize {
+        walk(&dir.join("objects")).len()
+    }
+
+    // Criterion 1: the measured disk occupation never exceeds `max_size`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_never_exceed_max_size() {
+        let dir = TempDir::new().unwrap();
+        let max_size = 64 * BLOCK;
+        let store = Store::open(dir.path(), options(max_size)).await.unwrap();
+        ready(&store).await;
+        let peak = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (peak, stop, root) = (
+                Arc::clone(&peak),
+                Arc::clone(&stop),
+                dir.path().to_path_buf(),
+            );
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Acquire) {
+                    peak.fetch_max(disk_charged(&root), Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_micros(200)).await;
+                }
+                peak.fetch_max(disk_charged(&root), Ordering::SeqCst);
+            })
+        };
+        let mut writers = Vec::new();
+        for i in 0_u8..64 {
+            let store = store.clone();
+            writers.push(tokio::spawn(async move {
+                let len = (usize::from(i) * 37 % 40 + 1) * 1024;
+                put_vec(&store, &key(&format!("k{i}")), vec![i; len]).await
+            }));
+        }
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        sampler.await.unwrap();
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= max_size,
+            "disk occupation peaked at {peak}, above max_size {max_size}"
+        );
+        eventually("the index to equal the disk", || {
+            let stats = store.stats();
+            stats.size_bytes == disk_charged(dir.path())
+                && stats.entries == u64::try_from(object_files(dir.path())).unwrap()
+                && temporaries(&dir) == 0
+        })
+        .await;
+    }
+
+    // Criterion 1b: a pending deletion of the old version must not remove the new one.
+    #[tokio::test]
+    async fn evicted_then_rewritten_key_survives_pending_delete() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(3 * BLOCK)).await.unwrap();
+        assert_eq!(put(&store, &key("a"), b"old!").await, Outcome::Stored);
+        assert_eq!(put(&store, &key("b"), b"bbbb").await, Outcome::Stored);
+        assert_eq!(put(&store, &key("c"), b"cccc").await, Outcome::Stored);
+        store
+            .inner
+            .hooks
+            .hold_deletions
+            .store(true, Ordering::Release);
+        // Evicts `a` (LRU); its deletion stays pending behind the hook.
+        assert_eq!(put(&store, &key("d"), b"dddd").await, Outcome::Stored);
+        assert!(
+            dir.path().join(key("a").relative_path()).is_file(),
+            "pending deletion ran too early"
+        );
+        // Rewriting `a` now renames over the file the pending deletion targets.
+        assert_eq!(put(&store, &key("a"), b"new!").await, Outcome::Stored);
+        store
+            .inner
+            .hooks
+            .hold_deletions
+            .store(false, Ordering::Release);
+        eventually("pending deletions to drain", || {
+            store.inner.background.load(Ordering::Acquire) == 0
+        })
+        .await;
+        assert_eq!(
+            contents(&store, &key("a")).await.as_deref(),
+            Some(&b"new!"[..]),
+            "the pending deletion removed the rewritten version"
+        );
+    }
+
+    // Criterion 1c: eviction between lookup and open is absent or the new bytes, never Err.
+    #[tokio::test]
+    async fn read_racing_an_eviction_is_absent_or_new_bytes() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        assert_eq!(put(&store, &key("gone"), b"orig").await, Outcome::Stored);
+        store.inner.hooks.vanish_on_read.store(1, Ordering::Release);
+        assert!(
+            store.read(&key("gone")).await.unwrap().is_none(),
+            "a vanished file must read as absent"
+        );
+        assert_eq!(put(&store, &key("swapped"), b"orig").await, Outcome::Stored);
+        store.inner.hooks.vanish_on_read.store(2, Ordering::Release);
+        assert_eq!(
+            contents(&store, &key("swapped")).await.as_deref(),
+            Some(&b"replacement"[..]),
+            "the retry must open the replacement"
+        );
+    }
+
+    // Criterion 2: one key, many writers, exactly one whole content wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_of_one_key_never_mix() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        ready(&store).await;
+        let bodies: Vec<Vec<u8>> = (0_u8..16)
+            .map(|i| vec![i; 1000 + usize::from(i) * 100])
+            .collect();
+        let mut writers = Vec::new();
+        for body_bytes in &bodies {
+            let (store, data) = (store.clone(), body_bytes.clone());
+            writers.push(tokio::spawn(async move {
+                put_vec(&store, &key("same"), data).await
+            }));
+        }
+        for writer in writers {
+            assert_eq!(writer.await.unwrap(), Outcome::Stored);
+        }
+        let got = contents(&store, &key("same")).await.unwrap();
+        assert!(
+            bodies.contains(&got),
+            "the stored content is a mixture: {} bytes of {}",
+            got.len(),
+            got.first().copied().unwrap_or(0)
+        );
+        let stats = store.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.size_bytes, charge(u64::try_from(got.len()).unwrap()));
+    }
+
+    // Criterion 3: a reader keeps its version across an eviction (POSIX open file).
+    #[tokio::test]
+    async fn eviction_during_a_large_read_loses_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        let big: Vec<u8> = (0..512 * 1024)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        assert_eq!(
+            put_vec(&store, &key("big"), big.clone()).await,
+            Outcome::Stored
+        );
+        let object = store.read(&key("big")).await.unwrap().unwrap();
+        let big_path = dir.path().join(key("big").relative_path());
+        for i in 0..8 {
+            assert_eq!(
+                put_vec(&store, &key(&format!("filler{i}")), vec![7; 128 * 1024]).await,
+                Outcome::Stored
+            );
+        }
+        eventually("the evicted file to be unlinked", || !big_path.exists()).await;
+        let chunks: Vec<_> = pin!(object.into_stream())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| chunk.unwrap())
+            .collect();
+        assert!(chunks.iter().all(|chunk| chunk.len() <= READ_CHUNK));
+        let streamed: Vec<u8> = chunks.concat();
+        assert_eq!(streamed, big);
+    }
+
+    // Criterion 4: recency survives a restart through `mtime`.
+    #[tokio::test]
+    async fn recency_persists_across_a_reopen() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = options(2 * BLOCK);
+        opts.touch_interval = Duration::ZERO;
+        let store = Store::open(dir.path(), opts.clone()).await.unwrap();
+        assert_eq!(put(&store, &key("a"), b"aaaa").await, Outcome::Stored);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(put(&store, &key("b"), b"bbbb").await, Outcome::Stored);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(contents(&store, &key("a")).await.is_some());
+        store.close().await.unwrap();
+        drop(store);
+        let reopened = open_retried(dir.path(), opts).await;
+        ready(&reopened).await;
+        assert_eq!(put(&reopened, &key("c"), b"cccc").await, Outcome::Stored);
+        assert!(
+            contents(&reopened, &key("a")).await.is_some(),
+            "touched a was evicted"
+        );
+        assert!(
+            contents(&reopened, &key("b")).await.is_none(),
+            "stale b was kept"
+        );
+    }
+
+    // Criterion 5: crash leftovers in `tmp/` do not survive or get served.
+    #[tokio::test]
+    async fn crash_leftovers_do_not_survive_a_restart() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        assert_eq!(put(&store, &key("keep"), b"data").await, Outcome::Stored);
+        store.close().await.unwrap();
+        drop(store);
+        std::fs::write(dir.path().join("tmp").join("partial"), b"truncated upload").unwrap();
+        let reopened = open_retried(dir.path(), options(MIB)).await;
+        assert_eq!(temporaries(&dir), 0, "tmp/ was not emptied at start-up");
+        ready(&reopened).await;
+        assert_eq!(reopened.stats().entries, 1);
+        assert_eq!(
+            contents(&reopened, &key("keep")).await.as_deref(),
+            Some(&b"data"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_files_are_ignored_never_deleted() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        assert_eq!(put(&store, &key("keep"), b"data").await, Outcome::Stored);
+        store.close().await.unwrap();
+        drop(store);
+        let junk = dir.path().join("objects").join("junk.txt");
+        std::fs::write(&junk, b"not ours").unwrap();
+        let off_scheme = dir.path().join("objects").join("zz");
+        std::fs::create_dir_all(&off_scheme).unwrap();
+        std::fs::write(off_scheme.join("whatever"), b"not ours").unwrap();
+        let reopened = open_retried(dir.path(), options(MIB)).await;
+        ready(&reopened).await;
+        assert!(junk.is_file(), "an unknown file was deleted");
+        assert!(
+            off_scheme.join("whatever").is_file(),
+            "an unknown file was deleted"
+        );
+        assert_eq!(reopened.stats().entries, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_evicts_down_to_a_shrunk_max_size() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        for name in ["a", "b", "c"] {
+            assert_eq!(put(&store, &key(name), b"xxxx").await, Outcome::Stored);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        store.close().await.unwrap();
+        drop(store);
+        let reopened = open_retried(dir.path(), options(2 * BLOCK)).await;
+        ready(&reopened).await;
+        assert_eq!(reopened.stats().entries, 2);
+        assert!(
+            contents(&reopened, &key("a")).await.is_none(),
+            "oldest kept"
+        );
+        assert!(
+            contents(&reopened, &key("c")).await.is_some(),
+            "newest evicted"
+        );
+        eventually("the evicted file to be deleted", || {
+            object_files(dir.path()) == 2
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn not_ready_during_the_startup_scan() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        assert_eq!(put(&store, &key("k"), b"data").await, Outcome::Stored);
+        store.close().await.unwrap();
+        drop(store);
+        HOLD_SCAN.store(true, Ordering::Release);
+        let reopened = open_retried(dir.path(), options(MIB)).await;
+        let during = (
+            reopened.is_ready(),
+            matches!(
+                reopened.admit(&key("k"), 4),
+                Admission::Dropped(DropReason::NotReady)
+            ),
+            matches!(
+                reopened.admit(&key("k"), MIB + 1),
+                Admission::Dropped(DropReason::TooLarge)
+            ),
+            contents(&reopened, &key("k"))
+                .await
+                .as_deref()
+                .map(<[u8]>::to_vec),
+        );
+        HOLD_SCAN.store(false, Ordering::Release);
+        assert_eq!(during, (false, true, true, Some(b"data".to_vec())));
+        ready(&reopened).await;
+        assert!(matches!(
+            reopened.admit(&key("k"), 4),
+            Admission::Reserved(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pinned_key_is_not_evicted() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(2 * BLOCK)).await.unwrap();
+        assert_eq!(put(&store, &key("a"), b"aaaa").await, Outcome::Stored);
+        assert_eq!(put(&store, &key("b"), b"bbbb").await, Outcome::Stored);
+        // Reserving `a` again pins its stored version; making room evicts `b`.
+        let Admission::Reserved(reservation) = store.admit(&key("a"), 4) else {
+            panic!("not admitted")
+        };
+        assert_eq!(
+            contents(&store, &key("a")).await.as_deref(),
+            Some(&b"aaaa"[..])
+        );
+        assert!(contents(&store, &key("b")).await.is_none());
+        assert_eq!(reservation.write(body(&[b"new!"])).await, Outcome::Stored);
+        assert_eq!(
+            contents(&store, &key("a")).await.as_deref(),
+            Some(&b"new!"[..])
+        );
+    }
+
+    // D33: small objects are one `Bytes`; large ones are 64 KiB blocks.
+    #[tokio::test]
+    async fn read_stream_shapes_follow_d33() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        assert_eq!(
+            put_vec(&store, &key("small"), vec![3; 1000]).await,
+            Outcome::Stored
+        );
+        let small = store.read(&key("small")).await.unwrap().unwrap();
+        let chunks: Vec<_> = pin!(small.into_stream()).collect::<Vec<_>>().await;
+        assert_eq!(chunks.len(), 1, "a small object must be a single Bytes");
+        assert_eq!(
+            put_vec(&store, &key("large"), vec![4; 200 * 1024]).await,
+            Outcome::Stored
+        );
+        let large = store.read(&key("large")).await.unwrap().unwrap();
+        let chunks: Vec<_> = pin!(large.into_stream())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| chunk.unwrap())
+            .collect();
+        assert_eq!(chunks.len(), 4);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= READ_CHUNK));
+        assert_eq!(chunks.concat(), vec![4; 200 * 1024]);
+    }
+
+    // Criterion 7: a 1 GiB object streams in bounded blocks (sparse file on disk).
+    #[tokio::test]
+    async fn one_gib_object_streams_in_bounded_blocks() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(4 * GIB)).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let path = dir.path().join(key("huge").relative_path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        StdFile::create(&path).unwrap().set_len(GIB).unwrap();
+        let reopened = open_retried(dir.path(), options(4 * GIB)).await;
+        ready(&reopened).await;
+        let object = reopened.read(&key("huge")).await.unwrap().unwrap();
+        assert_eq!(object.size, GIB);
+        let mut stream = pin!(object.into_stream());
+        let (mut total, mut blocks) = (0_u64, 0_u64);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() <= READ_CHUNK, "oversized block {}", chunk.len());
+            total += u64::try_from(chunk.len()).unwrap();
+            blocks += 1;
+        }
+        assert_eq!(total, GIB);
+        assert_eq!(blocks, GIB / u64::try_from(READ_CHUNK).unwrap());
+    }
+
+    // Criterion 9: the D32 decision table, state by crafted state.
+    #[test]
+    fn purge_decision_table() {
+        assert!(purge_needed(None), "absent state must purge");
+        assert!(purge_needed(Some(State {
+            mode: Durability::PurgeOnCrash,
+            clean: false
+        })));
+        assert!(!purge_needed(Some(State {
+            mode: Durability::PurgeOnCrash,
+            clean: true
+        })));
+        assert!(!purge_needed(Some(State {
+            mode: Durability::Fsync,
+            clean: false
+        })));
+        assert!(!purge_needed(Some(State {
+            mode: Durability::Fsync,
+            clean: true
+        })));
+    }
+
+    fn craft_object(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(key(name).relative_path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"crafted").unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn absent_or_malformed_state_purges() {
+        for state in [None, Some("not a state\n")] {
+            let dir = TempDir::new().unwrap();
+            let object = craft_object(dir.path(), "k");
+            if let Some(text) = state {
+                std::fs::write(dir.path().join("state"), text).unwrap();
+            }
+            let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+            assert!(
+                !object.exists(),
+                "an object under state {state:?} survived the purge"
+            );
+            ready(&store).await;
+            assert_eq!(store.stats().entries, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_purge_repeats_even_switching_to_fsync() {
+        let dir = TempDir::new().unwrap();
+        let first = craft_object(dir.path(), "k1");
+        let second = craft_object(dir.path(), "k2");
+        // A purge interrupted halfway leaves exactly this: purge demanded, objects left.
+        std::fs::write(
+            dir.path().join("state"),
+            "mode=purge-on-crash\nclean=false\n",
+        )
+        .unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        assert!(
+            !first.exists() && !second.exists(),
+            "the repeated purge missed an object"
+        );
+        let state = std::fs::read_to_string(dir.path().join("state")).unwrap();
+        assert_eq!(state, "mode=fsync\nclean=false\n");
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn clean_purge_on_crash_state_keeps_objects() {
+        let dir = TempDir::new().unwrap();
+        let object = craft_object(dir.path(), "k");
+        std::fs::write(
+            dir.path().join("state"),
+            "mode=purge-on-crash\nclean=true\n",
+        )
+        .unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        assert!(object.exists(), "a clean previous run's object was purged");
+        ready(&store).await;
+        assert_eq!(
+            contents(&store, &key("k")).await.as_deref(),
+            Some(&b"crafted"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn syncfs_failure_forbids_clean_and_purges_next_start() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = options(MIB);
+        opts.durability = Durability::PurgeOnCrash;
+        let store = Store::open(dir.path(), opts.clone()).await.unwrap();
+        assert_eq!(put(&store, &key("k"), b"data").await, Outcome::Stored);
+        store.inner.hooks.fail_syncfs.store(true, Ordering::Release);
+        assert!(
+            store.close().await.is_err(),
+            "a failing syncfs must fail close"
+        );
+        let state = std::fs::read_to_string(dir.path().join("state")).unwrap();
+        assert!(
+            state.contains("clean=false"),
+            "state wrongly clean: {state}"
+        );
+        drop(store);
+        let reopened = open_retried(dir.path(), opts).await;
+        ready(&reopened).await;
+        assert!(contents(&reopened, &key("k")).await.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn clean_close_keeps_a_purge_on_crash_store() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = options(MIB);
+        opts.durability = Durability::PurgeOnCrash;
+        let store = Store::open(dir.path(), opts.clone()).await.unwrap();
+        assert_eq!(put(&store, &key("k"), b"data").await, Outcome::Stored);
+        store.close().await.unwrap();
+        let state = std::fs::read_to_string(dir.path().join("state")).unwrap();
+        assert_eq!(state, "mode=purge-on-crash\nclean=true\n");
+        drop(store);
+        let reopened = open_retried(dir.path(), opts).await;
+        ready(&reopened).await;
+        assert_eq!(
+            contents(&reopened, &key("k")).await.as_deref(),
+            Some(&b"data"[..])
+        );
+    }
+
+    // Criterion 8 (local, not CI): parallel 1 MiB PUT/GET throughput, so the review can
+    // see the cost of the one index mutex. Run in release:
+    // `cargo test --release bench_ -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "local microbench"]
+    async fn bench_put_get_1mib_parallel() {
+        use std::time::Instant;
+        const TASKS: u64 = 16;
+        const OPS: u64 = 25;
+        let dir = TempDir::new().unwrap();
+        let mut opts = options(8 * 1024 * MIB);
+        opts.durability = Durability::PurgeOnCrash;
+        let store = Store::open(dir.path(), opts).await.unwrap();
+        ready(&store).await;
+        let payload = Bytes::from(vec![9_u8; usize::try_from(MIB).unwrap()]);
+        let started = Instant::now();
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let (store, payload) = (store.clone(), payload.clone());
+            handles.push(tokio::spawn(async move {
+                for i in 0..OPS {
+                    let k = key(&format!("bench/{t}/{i}"));
+                    let Admission::Reserved(reservation) = store.admit(&k, MIB) else {
+                        panic!("bench admission dropped")
+                    };
+                    let body = stream::iter([Ok::<_, Infallible>(payload.clone())]);
+                    assert_eq!(reservation.write(body).await, Outcome::Stored);
+                    let object = store.read(&k).await.unwrap().unwrap();
+                    let mut streamed = pin!(object.into_stream());
+                    let mut total = 0_u64;
+                    while let Some(chunk) = streamed.next().await {
+                        total += u64::try_from(chunk.unwrap().len()).unwrap();
+                    }
+                    assert_eq!(total, MIB);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let elapsed = started.elapsed();
+        let pairs = f64::from(u32::try_from(TASKS * OPS).unwrap());
+        println!(
+            "PUT+GET 1MiB x{} ({} tasks): {:?} -> {:.0} pairs/s, {:.0} MiB/s each way",
+            TASKS * OPS,
+            TASKS,
+            elapsed,
+            pairs / elapsed.as_secs_f64(),
+            pairs / elapsed.as_secs_f64()
+        );
+    }
+
+    // D33 (local, not CI): one-shot whole read vs 64 KiB streaming at 64/128/256 KiB.
+    #[tokio::test]
+    #[ignore = "local microbench"]
+    async fn bench_read_one_shot_vs_streaming() {
+        use std::time::Instant;
+        const READS: u32 = 300;
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(64 * MIB)).await.unwrap();
+        for kib in [64_u64, 128, 256] {
+            let size = kib * 1024;
+            let name = format!("obj{kib}");
+            assert_eq!(
+                put_vec(&store, &key(&name), vec![5; usize::try_from(size).unwrap()]).await,
+                Outcome::Stored
+            );
+            let path = dir.path().join(key(&name).relative_path());
+            let started = Instant::now();
+            for _ in 0..READS {
+                let read_path = path.clone();
+                let data = blocking(move || std::fs::read(&read_path).unwrap()).await;
+                assert_eq!(u64::try_from(data.len()).unwrap(), size);
+            }
+            let whole = started.elapsed();
+            let started = Instant::now();
+            for _ in 0..READS {
+                let object = store.read(&key(&name)).await.unwrap().unwrap();
+                let mut streamed = pin!(object.into_stream());
+                let mut total = 0_u64;
+                while let Some(chunk) = streamed.next().await {
+                    total += u64::try_from(chunk.unwrap().len()).unwrap();
+                }
+                assert_eq!(total, size);
+            }
+            let streamed = started.elapsed();
+            println!(
+                "{kib} KiB: whole-read {:?}/op, into_stream {:?}/op ({} reads)",
+                whole / READS,
+                streamed / READS,
+                READS
+            );
+        }
+    }
+
+    // D36 (local, not CI): time to readiness over a prepared tree. Point
+    // `CACHETTE_BENCH_SCAN_DIR` at a data directory holding `objects/` and a clean
+    // `state`; prints entries and scan time.
+    #[tokio::test]
+    #[ignore = "local microbench"]
+    async fn bench_startup_scan() {
+        use std::time::Instant;
+        let dir = std::env::var_os("CACHETTE_BENCH_SCAN_DIR")
+            .expect("CACHETTE_BENCH_SCAN_DIR must name the prepared data directory");
+        let started = Instant::now();
+        let store = Store::open(Path::new(&dir), options(u64::MAX / 4))
+            .await
+            .unwrap();
+        ready(&store).await;
+        println!(
+            "scan of {} entries ready in {:?}",
+            store.stats().entries,
+            started.elapsed()
+        );
     }
 }
