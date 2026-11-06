@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shlex
 import shutil
 import signal
 import socket
@@ -115,17 +116,36 @@ def cachette_config(cap_mib, durability):
             f'name = "bench"\nsecret = "{TOKEN}"\naccess = "write"\n')
 
 
+def machine_label():
+    """Public label for a machine: OS, architecture and thread count, never its name."""
+    return f"{platform.system().lower()}-{platform.machine()}-{os.cpu_count()}t"
+
+
+def report_identity(stamp):
+    """Report file name and its host field, both from the neutral machine label."""
+    label = machine_label()
+    return label, f"{stamp}-{label}.md"
+
+
+def replay_command():
+    """The command line that produced this report, with the home directory as `~`."""
+    home = str(Path.home())
+    argv = [arg.replace(home, "~") for arg in sys.argv[1:]]
+    return shlex.join(["python3", "-B", "bench/run.py", *argv])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--servers", nargs="+", choices=PORTS, default=list(PORTS))
     parser.add_argument("--seconds", type=int, default=10)
     parser.add_argument("--max-load", type=float, default=2.0)
     parser.add_argument("--cap-mib", type=int, default=4096)
-    parser.add_argument("--work-dir", type=Path, default=Path.home() / "cachette-bench")
+    parser.add_argument("--work-dir", type=Path, help="Defaults to ~/cachette-bench on the host that runs it")
     parser.add_argument("--results", type=Path, default=HERE / "results")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--remote", help="Run the client here and servers over SSH on this Tailscale host")
-    parser.add_argument("--remote-root", default="/home/debian/cachette-bench/repo")
+    parser.add_argument("--remote-root", default="~/cachette-bench/repo",
+                        help="Checkout path on the remote host, with --remote; ~/ is its home")
     parser.add_argument("--oha", type=Path, help="Native oha 1.14.0 binary for the Tailscale client")
     parser.add_argument("--tailscale-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -136,6 +156,8 @@ def main():
     if args.remote:
         from network import coordinate
         return coordinate(args)
+    if args.work_dir is None:
+        args.work_dir = Path.home() / "cachette-bench"
     global LISTEN
     if args.tailscale_worker:
         from network import rpc
@@ -154,9 +176,10 @@ def main():
     args.work_dir.mkdir(parents=True, exist_ok=True)
     args.results.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
-    report = args.results / f"{stamp}-{socket.gethostname()}.md"
+    label, name = report_identity(stamp)
+    report = args.results / name
     metadata = {
-        "utc": stamp, "host": socket.gethostname(), "kernel": platform.platform(),
+        "utc": stamp, "host": label, "kernel": platform.platform(),
         "uptime": command("uptime"), "nproc": command("nproc"),
         "disk": command("df", "-T", str(args.work_dir)),
         "mount": command("findmnt", "-T", str(args.work_dir), "-o", "SOURCE,FSTYPE,OPTIONS"),
@@ -403,8 +426,8 @@ def render(path, metadata, versions, probes, rows, pressure, failure):
     lines += [f"| {p['server']} | {p.get('durability', DURABILITY.get(p['server'], 'unspecified'))} | {p['seconds']:.3f} | {p['allocated']} |" for p in pressure]
     lines += ["", "## Limits and replay", "", "See ../README.md: loopback, shared machine, hot kernel page cache, different durability policies.",
               "cachette is unmeasured unless explicitly present above; no comparative claim about it follows.", "",
-              "Final replay from the repository root on dev2 (after store/http merge):", "", "```sh",
-              "sudo timeout 3600 python3 bench/run.py --work-dir /home/debian/cachette-bench --seconds 10", "```", ""]
+              "Final replay from the repository root:", "", "```sh",
+              replay_command(), "```", ""]
     if metadata.get("path") == "Tailscale":
         lines += ["", "## Tailscale and host CPU", "",
                   "CPU is whole-host busy percentage over each request interval, including other workloads and Tailscale; not process attribution.",

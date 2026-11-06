@@ -158,7 +158,7 @@ class MatrixTests(unittest.TestCase):
 class NetworkTests(unittest.TestCase):
     def test_ping_retains_rtt_and_route_changes(self):
         from network import ping_evidence
-        evidence = ping_evidence("pong from dev2 via DERP(fra) in 28ms\npong from dev2 via [::1]:41641 in 11ms")
+        evidence = ping_evidence("pong from bench-server via DERP(fra) in 28ms\npong from bench-server via [::1]:41641 in 11ms")
         self.assertEqual(evidence["rtt_ms"], [28, 11])
         self.assertEqual(evidence["states"], ["DERP", "direct"])
         with self.assertRaises(RuntimeError):
@@ -166,9 +166,16 @@ class NetworkTests(unittest.TestCase):
 
     def test_remote_cli_refuses_busy_client_before_oha_or_ssh(self):
         result = subprocess.run([sys.executable, "-B", "-c",
-            f'import os,runpy,sys; sys.path.insert(0,{str(RUN.parent)!r}); os.getloadavg=lambda:(3,0,0); sys.argv=[{str(RUN)!r},"--remote","dev2","--oha","/missing","--preflight-only"]; runpy.run_path({str(RUN)!r},run_name="__main__")'], capture_output=True, text=True)
+            f'import os,runpy,sys; sys.path.insert(0,{str(RUN.parent)!r}); os.getloadavg=lambda:(3,0,0); sys.argv=[{str(RUN)!r},"--remote","bench-server","--oha","/missing","--preflight-only"]; runpy.run_path({str(RUN)!r},run_name="__main__")'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("Refusing client: 1-minute load", result.stderr)
+
+    def test_remote_paths_resolve_the_remote_home(self):
+        import network
+        with patch.object(network, "command", return_value="/fixture/home"):
+            self.assertEqual(network.remote_path("bench-server", "~/cachette-bench/repo"),
+                             "/fixture/home/cachette-bench/repo")
+            self.assertEqual(network.remote_path("bench-server", Path("/srv/repo")), "/srv/repo")
 
     def test_control_protocol_runs_client_and_writes_one_report(self):
         import network
@@ -203,11 +210,11 @@ exchange(dict(action='report',name='fixture.md',text=json.dumps(result)))
             if args[0] == "ssh":
                 return "100.64.0.1"
             if args[0] == "tailscale" and args[1] == "ping":
-                return "pong from dev2 via 127.0.0.1:41641 in 11ms"
+                return "pong from bench-server via 127.0.0.1:41641 in 11ms"
             return "fixture"
         with tempfile.TemporaryDirectory() as directory:
             args = types.SimpleNamespace(max_load=2, oha=Path("/fixture/oha"), preflight_only=False,
-                remote="dev2", remote_root="/fixture/repo", servers=["nginx"], seconds=1,
+                remote="bench-server", remote_root="/fixture/repo", servers=["nginx"], seconds=1,
                 cap_mib=4096, work_dir=Path(directory), results=Path(directory))
             with patch.object(network, "command", side_effect=tool), patch("os.getloadavg", return_value=(0,0,0)), \
                  patch.object(network, "cpu_ticks", side_effect=[(100,50),(300,100)]), \
@@ -219,6 +226,19 @@ exchange(dict(action='report',name='fixture.md',text=json.dumps(result)))
             self.assertEqual(result["oha"], {"fixture": True})
             self.assertEqual(result["cpu_busy"], 75)
             self.assertEqual(result["ping_after"]["rtt_ms"], [11])
+
+
+class ReportIdentityTests(unittest.TestCase):
+    def test_report_name_and_host_come_from_the_label_not_the_hostname(self):
+        with patch("socket.gethostname", return_value="leak-host"), \
+             patch("platform.node", return_value="leak-host"), \
+             patch("platform.system", return_value="Linux"), \
+             patch("platform.machine", return_value="x86_64"), \
+             patch("os.cpu_count", return_value=16):
+            host, name = run.report_identity("2026-11-06T204503Z")
+        self.assertEqual(host, "linux-x86_64-16t")
+        self.assertEqual(name, "2026-11-06T204503Z-linux-x86_64-16t.md")
+        self.assertNotIn("leak-host", host + name)
 
 
 class ReportTests(unittest.TestCase):
