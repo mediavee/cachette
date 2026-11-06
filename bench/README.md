@@ -3,8 +3,9 @@
 `run.py` is the single entry point. It uses Python's standard library, Docker on
 the Linux x86_64 server host for servers and the loopback client, and a native
 oha build on the macOS arm64 client host for the Tailscale client. No Python
-packages are needed. No result here establishes that cachette meets D30: its real
-store/HTTP implementation is still unavailable.
+packages are needed. The [final run](results/2026-11-06T204503Z-linux-x86_64-16t.md)
+measures cachette's real store and HTTP path; the comparison in the top-level README
+comes from it.
 
 ## Loopback replay on the server host
 
@@ -116,11 +117,8 @@ TCP settings or release flags to improve results. The builder compiles with
 two jobs and copies only Cargo manifests and `src/`, excluding host build outputs
 and benchmark reports from its inputs. TOML uses `durability`, not
 the removed `fsync` boolean. Each mode gets fresh storage and an explicitly
-labelled table cell. The musl build and both configurations were smoke-tested against the foundation
-at source `7ab6586`: the scratch image returns 200 on `/healthz` in each mode,
-and the legacy `fsync` field is rejected with exit 1. This validates build,
-configuration and startup only. The real blob store/HTTP path remains unverified;
-no cachette performance figures are fabricated.
+labelled table cell. Runs before `2026-11-06T204503Z` predate cachette's store and
+HTTP path: they contain no cachette figures.
 
 - oha **1.14.0**, commit `9766ca2b725b69b7606b99861d01c779b4aeb65d`, locked build.
 - fosterstack `31e69559cde78277192281173176a9e25d13a3bb`, vendored dependencies,
@@ -187,12 +185,16 @@ causes. Replay on a quiet host for 30 seconds before drawing a conclusion.
 Loopback shares client/server CPU and memory. Page cache is hot; no cold-disk
 or remote-network claim follows. A successful PUT is not proof of retention
 (cachette can acknowledge dropped uploads with 200). True Gradle/sccache build
-results belong to the clients lot; D30 remains unproven here.
+results come from the `clients` workflow, not from this benchmark.
 
 ## Recorded runs
 
-The historical successful reports retain their original source/configuration
-and measurements, with raw evidence consolidated into each Markdown file:
+The successful reports retain their original source/configuration and
+measurements, with raw evidence consolidated into each Markdown file:
+
+- [Final run, 4 GiB, 10 s, two runs per point](results/2026-11-06T204503Z-linux-x86_64-16t.md):
+  cachette in both durability modes against nginx, bazel-remote and fosterstack,
+  from source `deef48e`. The top-level README summarises it with its limits.
 
 - [Expanded 4 GiB matrix, 5 s](results/2026-11-06T181342Z-linux-x86_64-16t.md):
   exit 0 on pushed source `c557b0bb45230633bac544edfd73d2b1951eb00f`;
