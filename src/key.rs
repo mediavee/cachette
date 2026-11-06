@@ -3,14 +3,7 @@
 //! A key is never used as a file name. Objects live under `objects/<2 hex>/<64 hex>` where the hex
 //! is the blake3 digest of the normalised key, so no key can address anything outside that tree.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the http and store lots are the callers; removed once both use it"
-    )
-)]
-
+use std::borrow::Cow;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -63,6 +56,116 @@ impl Key {
     /// Returns a [`KeyError`] when the path is empty, too long, has too many segments, contains a
     /// `.` or `..` segment, or contains a control character.
     pub(crate) fn new(decoded: &str) -> Result<Self, KeyError> {
+        Ok(Self(normalise(decoded)?.into_owned()))
+    }
+
+    /// Builds a key from the raw, still percent-encoded path of a request URI.
+    ///
+    /// The path is decoded exactly once, strictly as UTF-8, so `%252e` is the literal segment
+    /// `%2e`, not `.`. An encoded slash (`%2F`) separates segments like a plain one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyError::NotUtf8`] when the decoded bytes are not UTF-8, and any error of
+    /// [`Key::new`] otherwise.
+    pub(crate) fn from_uri_path(raw: &str) -> Result<Self, KeyError> {
+        // Most paths carry no escape; skip the byte-wise decoder for them.
+        let decoded = if raw.contains('%') {
+            percent_decode_str(raw)
+                .decode_utf8()
+                .map_err(|_| KeyError::NotUtf8)?
+        } else {
+            Cow::Borrowed(raw)
+        };
+        Self::new(&decoded)
+    }
+
+    /// The normalised key, without leading or trailing `/`.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Where the object of this key lives, relative to the data directory:
+    /// `objects/<first 2 hex of the digest>/<64 hex of the digest>`.
+    ///
+    /// Every component is a plain name, so joining it onto the data directory stays below
+    /// `<data dir>/objects` whatever the key was.
+    pub(crate) fn relative_path(&self) -> PathBuf {
+        let digest = blake3::hash(self.0.as_bytes()).to_hex();
+        let digest = digest.as_str();
+        ["objects", &digest[..2], digest].iter().collect()
+    }
+}
+
+/// Validates `decoded` as a key and returns it normalised, borrowed from `decoded` whenever
+/// possible.
+///
+/// A `/` at either end is only trimmed, so the usual key (`/<hex>`, `/<prefix>/a/b/<hex>`) is a
+/// sub-slice and allocates nothing. Only a repeated `/` inside the path forces a new string.
+fn normalise(decoded: &str) -> Result<Cow<'_, str>, KeyError> {
+    let trimmed = decoded.trim_matches('/');
+    let mut segments = 0_usize;
+    let mut bytes = 0_usize;
+    let mut repeated = false;
+    for segment in trimmed.split('/') {
+        if segment.is_empty() {
+            repeated = true;
+            continue;
+        }
+        if segment == "." || segment == ".." {
+            return Err(KeyError::DotSegment);
+        }
+        if segment.chars().any(char::is_control) {
+            return Err(KeyError::ControlCharacter);
+        }
+        segments += 1;
+        if segments > MAX_SEGMENTS {
+            return Err(KeyError::TooManySegments);
+        }
+        bytes += segment.len();
+    }
+    if segments == 0 {
+        return Err(KeyError::Empty);
+    }
+    // One `/` between segments.
+    let len = bytes + segments - 1;
+    if len > MAX_KEY_BYTES {
+        return Err(KeyError::TooLong { len });
+    }
+    if !repeated {
+        return Ok(Cow::Borrowed(trimmed));
+    }
+    let mut normalised = String::with_capacity(len);
+    for (index, segment) in trimmed
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .enumerate()
+    {
+        if index > 0 {
+            normalised.push('/');
+        }
+        normalised.push_str(segment);
+    }
+    Ok(Cow::Owned(normalised))
+}
+
+impl fmt::Display for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// Normalisation as it was before D39: always builds a `String`. Kept as the specification
+    /// the borrowing implementation must agree with, byte for byte.
+    fn reference_new(decoded: &str) -> Result<String, KeyError> {
         let mut normalised = String::with_capacity(decoded.len().min(MAX_KEY_BYTES));
         let mut segments = 0_usize;
         for segment in decoded.split('/').filter(|segment| !segment.is_empty()) {
@@ -89,55 +192,46 @@ impl Key {
                 len: normalised.len(),
             });
         }
-        Ok(Self(normalised))
+        Ok(normalised)
     }
 
-    /// Builds a key from the raw, still percent-encoded path of a request URI.
-    ///
-    /// The path is decoded exactly once, strictly as UTF-8, so `%252e` is the literal segment
-    /// `%2e`, not `.`. An encoded slash (`%2F`) separates segments like a plain one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KeyError::NotUtf8`] when the decoded bytes are not UTF-8, and any error of
-    /// [`Key::new`] otherwise.
-    pub(crate) fn from_uri_path(raw: &str) -> Result<Self, KeyError> {
+    fn reference_from_uri_path(raw: &str) -> Result<String, KeyError> {
         let decoded = percent_decode_str(raw)
             .decode_utf8()
             .map_err(|_| KeyError::NotUtf8)?;
-        Self::new(&decoded)
+        reference_new(&decoded)
     }
 
-    /// The normalised key, without leading or trailing `/`.
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Where the object of this key lives, relative to the data directory:
-    /// `objects/<first 2 hex of the digest>/<64 hex of the digest>`.
-    ///
-    /// Every component is a plain name, so joining it onto the data directory stays below
-    /// `<data dir>/objects` whatever the key was.
-    pub(crate) fn relative_path(&self) -> PathBuf {
-        let digest = blake3::hash(self.0.as_bytes()).to_hex();
+    /// The on-disk path of a key, from its text alone: the digest D9 names the file by.
+    fn reference_path(key: &str) -> PathBuf {
+        let digest = blake3::hash(key.as_bytes()).to_hex();
         let digest = digest.as_str();
-        ["objects", &digest[..2], digest].iter().collect()
+        PathBuf::from(format!("objects/{}/{digest}", &digest[..2]))
     }
-}
 
-impl fmt::Display for Key {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+    /// What a key and its path are, or why the input is refused, as the reference computes it.
+    fn reference_outcome(key: Result<String, KeyError>) -> Result<(String, PathBuf), KeyError> {
+        key.map(|text| {
+            let path = reference_path(&text);
+            (text, path)
+        })
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
+    fn outcome(key: Result<Key, KeyError>) -> Result<(String, PathBuf), KeyError> {
+        key.map(|key| (key.as_str().to_owned(), key.relative_path()))
+    }
 
-    use proptest::prelude::*;
-
-    use super::*;
+    /// Inputs that reach every branch of normalisation: escapes, edge and repeated slashes, dot
+    /// segments, controls, and sizes around both limits.
+    fn near_the_rules() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "(/|%2[fFeE]|%25|%00|%7[fF]|%ff|%[0-9a-fA-F]{2}|[a-c.]|\\u{e9}){0,40}",
+            "(/{0,3}[a-b]{1,60}){0,40}",
+            "/{0,2}[a-b]{1015,1030}/{0,2}",
+            "(/{0,2}[a-b]{0,3}){28,36}",
+            "/?([0-9a-f]{32}|[a-c]/){0,3}[0-9a-f]{0,64}/?",
+        ]
+    }
 
     /// Strings biased towards what the normaliser must handle: slashes, dots, `%`, controls.
     fn awkward() -> impl Strategy<Value = String> {
@@ -171,6 +265,34 @@ mod tests {
             !text.chars().any(char::is_control),
             "control character in {text:?}"
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        #[test]
+        fn new_agrees_with_the_reference(
+            input in prop_oneof![awkward(), near_the_rules()]
+        ) {
+            prop_assert_eq!(
+                outcome(Key::new(&input)),
+                reference_outcome(reference_new(&input)),
+                "input {:?}",
+                input
+            );
+        }
+
+        #[test]
+        fn from_uri_path_agrees_with_the_reference(
+            input in prop_oneof![awkward(), near_the_rules()]
+        ) {
+            prop_assert_eq!(
+                outcome(Key::from_uri_path(&input)),
+                reference_outcome(reference_from_uri_path(&input)),
+                "input {:?}",
+                input
+            );
+        }
     }
 
     proptest! {
@@ -254,5 +376,120 @@ mod tests {
             Err(KeyError::TooLong { len: 1025 })
         );
         assert!(Key::new(&"a".repeat(1024)).is_ok());
+    }
+
+    #[test]
+    fn borrows_unless_a_slash_repeats_inside() {
+        for borrowed in ["a/b", "a", "/a/b", "a/b/", "//a/b///"] {
+            assert!(
+                matches!(normalise(borrowed), Ok(Cow::Borrowed("a/b" | "a"))),
+                "{borrowed:?} was copied"
+            );
+        }
+        for rewritten in ["a//b", "/a///b/"] {
+            assert_eq!(normalise(rewritten), Ok(Cow::Owned("a/b".to_owned())));
+        }
+    }
+
+    /// Allocation counts. Only on targets where the test binary may own its global allocator: the
+    /// musl build already ships mimalloc as the global one (`main.rs`), and there can be one.
+    #[cfg(not(target_env = "musl"))]
+    mod allocations {
+        use std::hint::black_box;
+
+        use super::*;
+
+        mod counting {
+            use std::alloc::{GlobalAlloc, Layout, System};
+            use std::cell::Cell;
+
+            thread_local! {
+                // Per thread, so tests running in parallel do not count each other's allocations.
+                static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+            }
+
+            struct Counting;
+
+            fn record() {
+                // Fails only while the thread is being torn down; nothing is left to count then.
+                let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+            }
+
+            // SAFETY: every method forwards its arguments unchanged to `System`, which upholds the
+            // `GlobalAlloc` contract; counting only touches a const-initialised thread-local `Cell`,
+            // which never allocates.
+            unsafe impl GlobalAlloc for Counting {
+                unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                    record();
+                    // SAFETY: the caller upholds the contract of `GlobalAlloc::alloc`.
+                    unsafe { System.alloc(layout) }
+                }
+
+                unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                    record();
+                    // SAFETY: the caller upholds the contract of `GlobalAlloc::alloc_zeroed`.
+                    unsafe { System.alloc_zeroed(layout) }
+                }
+
+                unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                    record();
+                    // SAFETY: the caller upholds the contract of `GlobalAlloc::realloc`.
+                    unsafe { System.realloc(ptr, layout, new_size) }
+                }
+
+                unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                    // SAFETY: the caller upholds the contract of `GlobalAlloc::dealloc`.
+                    unsafe { System.dealloc(ptr, layout) }
+                }
+            }
+
+            #[global_allocator]
+            static COUNTING: Counting = Counting;
+
+            /// Runs `work` and returns its result with the allocations this thread made meanwhile.
+            pub(super) fn allocations_in<T>(work: impl FnOnce() -> T) -> (T, usize) {
+                let before = ALLOCATIONS.with(Cell::get);
+                let result = work();
+                (result, ALLOCATIONS.with(Cell::get) - before)
+            }
+        }
+
+        /// A Gradle key and an sccache key, as they reach `from_uri_path`.
+        const NORMAL_PATHS: [&str; 2] = [
+            "/0123456789abcdef0123456789abcdef",
+            "/sccache/a/b/c/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ];
+
+        #[test]
+        fn normalising_a_gradle_or_sccache_key_allocates_nothing() {
+            for path in NORMAL_PATHS {
+                let path = black_box(path);
+                let (normalised, allocations) = counting::allocations_in(|| normalise(path));
+                assert_eq!(normalised.as_deref(), Ok(&path[1..]), "path {path:?}");
+                assert_eq!(allocations, 0, "path {path:?}");
+            }
+        }
+
+        #[test]
+        fn a_key_costs_the_one_allocation_that_owns_it() {
+            for path in NORMAL_PATHS {
+                let path = black_box(path);
+                let (built, allocations) = counting::allocations_in(|| Key::from_uri_path(path));
+                assert_eq!(built.map(|key| key.to_string()), Ok(path[1..].to_owned()));
+                assert_eq!(allocations, 1, "Key::from_uri_path({path:?})");
+            }
+        }
+
+        /// Guards the counter itself: a rewrite must allocate, or a count of zero proves nothing.
+        #[test]
+        fn the_counter_sees_a_rewrite() {
+            let (rewritten, allocations) =
+                counting::allocations_in(|| normalise(black_box("/a//b")));
+            assert_eq!(rewritten, Ok(Cow::Owned("a/b".to_owned())));
+            assert!(
+                allocations >= 1,
+                "the counter saw {allocations} allocations"
+            );
+        }
     }
 }
