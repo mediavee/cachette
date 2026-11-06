@@ -185,8 +185,8 @@ def main():
                                 while not stop.is_set():
                                     # docker top includes the master and all nginx workers, in KiB.
                                     try:
-                                        text = command("docker", "top", name, "-eo", "rss")
-                                        peak[0] = max(peak[0], sum(int(v) for v in text.splitlines()[1:]))
+                                        text = command("docker", "top", name, "-eo", "pid,rss")
+                                        peak[0] = max(peak[0], sum(int(v.split()[1]) for v in text.splitlines()[1:]))
                                     except Exception as exc:
                                         sample_errors.append(exc)
                                         return
