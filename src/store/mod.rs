@@ -7,7 +7,9 @@
 //! signature in this file. What any implementation must guarantee:
 //!
 //! * **Bounded size (D12).** Live bytes (stored objects + reservations in flight) plus bytes
-//!   evicted but not yet deleted never exceed `max_size`, at any instant. Sizes are charged
+//!   evicted but not yet deleted never exceed `max_size`, at any instant. One POSIX exception:
+//!   a file evicted or replaced while a GET reads it keeps its blocks until that read ends, a
+//!   transient excess bounded by the reads in flight (bazel-remote behaves the same). Sizes are charged
 //!   rounded up to 4 KiB. [`Store::admit`] evicts least recently used entries only for the
 //!   reservation's own room in *live* bytes — never to cover deletions already in flight — and
 //!   refuses with [`DropReason::NoSpace`] when the reservation would push live + being-deleted
@@ -325,6 +327,49 @@ struct Hooks {
     panic_scan: AtomicBool,
     /// The start-up scan waits while this is set, holding the `not_ready` window (D14).
     hold_scan: AtomicBool,
+    /// Free-disk samples wait while this is set, keeping the last one stale.
+    hold_free_disk: AtomicBool,
+    /// `close` pauses at this point until `close_release`.
+    pause_close_at: Mutex<Option<ClosePoint>>,
+    close_reached: AtomicBool,
+    close_release: AtomicBool,
+    /// `close_blocking` returned.
+    close_done: AtomicBool,
+}
+
+/// Where a test may pause [`close_blocking`], to cancel the close there.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosePoint {
+    Drained,
+    Touched,
+    Synced,
+    Prepared,
+}
+
+#[cfg(test)]
+fn close_point(inner: &Inner, point: ClosePoint) {
+    if *inner
+        .hooks
+        .pause_close_at
+        .lock()
+        .expect("close hook poisoned")
+        == Some(point)
+    {
+        inner.hooks.close_reached.store(true, Ordering::Release);
+        while !inner.hooks.close_release.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// Whether a clean state may still be published (D32): decided once, under one lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseDecision {
+    Pending,
+    /// The close was cancelled or ran past the shutdown deadline: never `clean = true`.
+    Abandoned,
+    Published,
 }
 
 #[derive(Debug)]
@@ -340,16 +385,15 @@ struct Inner {
     /// an admission or a read.
     validation: Mutex<()>,
     ready: AtomicBool,
+    /// Set by [`Store::begin_close`]: admissions refused, refused deletions not retried.
     closed: AtomicBool,
-    /// [`Store::close`] was dropped at the shutdown deadline: `clean = true` is forbidden.
-    close_abandoned: AtomicBool,
+    /// Taken by the clean-state publication and by a cancelled close, so a cancellation
+    /// lands either before the publication (which then never happens) or after it.
+    close_decision: Mutex<CloseDecision>,
     next_tmp: AtomicU64,
     /// Background tasks (scan, deletions, touches, writers) still running; `close` waits
     /// for zero beyond itself before it may call the run clean.
     background: AtomicU64,
-    /// Last free-disk sample, refreshed off the request path so `admit` does no I/O (D7).
-    /// Admissions subtract the bytes reserved since (in `reserved`), failing closed.
-    free_disk: AtomicU64,
     /// A free-disk refresh task is running (single-flight, D12).
     free_refreshing: AtomicBool,
     #[cfg(test)]
@@ -435,10 +479,24 @@ fn sample_free_disk(path: &Path) -> u64 {
     }
 }
 
+/// Samples free disk space off the request path, so `admit` does no I/O (D7). The mark is
+/// read before the sample, so every reservation the sample may miss stays debited.
 fn refresh_free_disk(inner: &Inner) {
+    #[cfg(test)]
+    while inner.hooks.hold_free_disk.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mark = inner
+        .index
+        .lock()
+        .expect("index lock poisoned")
+        .free_disk_mark();
+    let free = sample_free_disk(&inner.root);
     inner
-        .free_disk
-        .store(sample_free_disk(&inner.root), Ordering::Release);
+        .index
+        .lock()
+        .expect("index lock poisoned")
+        .record_free_disk(free, mark);
 }
 
 /// Starts one background free-disk refresh if none is running, so a store refusing for
@@ -634,11 +692,7 @@ impl Store {
             if inner.closed.load(Ordering::Acquire) {
                 return Admission::Dropped(DropReason::NotReady);
             }
-            let free = inner
-                .free_disk
-                .load(Ordering::Acquire)
-                .saturating_sub(index.reserved);
-            if free < inner.options.min_free_disk.saturating_add(charged) {
+            if index.known_free_disk() < inner.options.min_free_disk.saturating_add(charged) {
                 disk_refused = true;
                 false
             } else {
@@ -689,7 +743,7 @@ impl Store {
                 let fits_hard =
                     index.charged_total().saturating_add(charged) <= inner.options.max_size;
                 if fits_live && fits_hard {
-                    index.reserved = index.reserved.saturating_add(charged);
+                    index.reserve(charged);
                     true
                 } else {
                     index.unpin(digest);
@@ -732,26 +786,30 @@ impl Store {
         }
     }
 
+    /// The first step of a shutdown, synchronous and without I/O: closes admissions and
+    /// stops retrying refused deletions, so no background task outlives the shutdown
+    /// deadline even when draining spends it all and [`Store::close`] never runs (D32).
+    pub(crate) fn begin_close(&self) {
+        // Under the index lock, so no admission can slip between the check there and this
+        // store: every reservation is either in `reserved` (and waited for) or refused.
+        let _index = self.inner.index.lock().expect("index lock poisoned");
+        self.inner.closed.store(true, Ordering::Release);
+    }
+
     /// Flushes what shutdown must persist (late recency updates). Call once the server drained.
     ///
     /// Closes admissions, waits for every writer, background task and outstanding
     /// reservation, persists late recency, then — `purge-on-crash` only — runs a checked
     /// `syncfs` before writing `clean = true` (D32). The caller bounds it with the shutdown
-    /// deadline: dropping this future before it finishes forbids `clean = true`, though the
-    /// blocking half it started keeps running until it notices.
+    /// deadline by dropping this future: a close dropped before it finished never writes
+    /// `clean = true`, though its blocking half runs on until it notices.
     ///
     /// # Errors
     ///
     /// [`Error::Io`] when a flush fails. The state stays `clean = false`.
     pub(crate) async fn close(&self) -> Result<(), Error> {
+        self.begin_close();
         let inner = Arc::clone(&self.inner);
-        {
-            // Under the index lock, so no admission can slip between the check there
-            // and this store: every reservation is either in `reserved` (and waited
-            // for) or refused.
-            let _index = inner.index.lock().expect("index lock poisoned");
-            inner.closed.store(true, Ordering::Release);
-        }
         let mut abandon = AbandonCloseOnDrop(Some(Arc::clone(&inner)));
         let result = blocking(move || close_blocking(&inner)).await;
         abandon.0 = None;
@@ -759,14 +817,23 @@ impl Store {
     }
 }
 
-/// Marks the close abandoned unless disarmed: [`Store::close`] dropped before it finished
-/// means the shutdown deadline passed, which forbids `clean = true` (D32).
+/// Abandons the close unless disarmed: [`Store::close`] dropped before it finished was
+/// cancelled or ran past the shutdown deadline, which forbids `clean = true` (D32).
 struct AbandonCloseOnDrop(Option<Arc<Inner>>);
 
 impl Drop for AbandonCloseOnDrop {
     fn drop(&mut self) {
         if let Some(inner) = &self.0 {
-            inner.close_abandoned.store(true, Ordering::Release);
+            // Waits out a publication in progress (a rename and a directory sync), so
+            // the outcome logged here is the one on disk.
+            let mut decision = inner
+                .close_decision
+                .lock()
+                .expect("close decision poisoned");
+            if *decision == CloseDecision::Pending {
+                *decision = CloseDecision::Abandoned;
+                warn!("store close abandoned at the shutdown deadline; the run stays not clean");
+            }
         }
     }
 }
@@ -807,10 +874,22 @@ fn retry_unlink(inner: &Inner, path: &Path, mut attempt: impl FnMut() -> io::Res
             }
             Err(e) => {
                 warn!(path = %path.display(), error = %e, retry_in = ?delay, "cannot delete file; retrying");
-                std::thread::sleep(delay);
+                sleep_unless_closing(inner, delay);
                 delay = (delay * 2).min(Duration::from_secs(5));
             }
         }
+    }
+}
+
+/// Sleeps `delay`, in slices short enough that a store starting to close is noticed at
+/// once: the runtime waits for blocking tasks at exit, so a backoff must not hold it.
+fn sleep_unless_closing(inner: &Inner, delay: Duration) {
+    const SLICE: Duration = Duration::from_millis(10);
+    let mut left = delay;
+    while !left.is_zero() && !inner.closed.load(Ordering::Acquire) {
+        let nap = left.min(SLICE);
+        std::thread::sleep(nap);
+        left = left.saturating_sub(nap);
     }
 }
 
@@ -820,7 +899,8 @@ fn unlink_with_retry(inner: &Inner, path: &Path) {
 
 /// Sets a file's `mtime` to `when` (the persisted recency, D14), unless the version it
 /// was decided for is gone. The generation is rechecked under the validation lock,
-/// which also keeps a rename from landing between the check and the update.
+/// which also keeps a rename from landing between the check and the update. Only a
+/// successful write counts as persisted; a failed one stays late for `close` to retry.
 fn touch(inner: &Inner, digest: Digest, path: &Path, when: SystemTime, generation: u64) {
     #[cfg(test)]
     {
@@ -834,18 +914,24 @@ fn touch(inner: &Inner, digest: Digest, path: &Path, when: SystemTime, generatio
         let index = inner.index.lock().expect("index lock poisoned");
         index.touch_applies(digest, generation, when)
     };
-    if !applies {
-        return;
-    }
-    match StdFile::options().write(true).open(path) {
-        Ok(file) => {
-            if let Err(e) = file.set_modified(when) {
+    let persisted = applies
+        && match StdFile::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(when))
+        {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => {
                 warn!(path = %path.display(), error = %e, "cannot persist recency");
+                false
             }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => warn!(path = %path.display(), error = %e, "cannot persist recency"),
-    }
+        };
+    inner
+        .index
+        .lock()
+        .expect("index lock poisoned")
+        .touch_settled(digest, generation, persisted.then_some(when));
 }
 
 /// Deletes one evicted object, unless a newer version was committed after the eviction
@@ -933,20 +1019,28 @@ fn purge_needed(previous: Option<State>) -> bool {
 /// Writes `state` via a synced temporary plus rename, then syncs the directory, so a crash
 /// leaves the old state or the new one, never a torn one.
 fn write_state(root: &Path, state: State) -> Result<(), Error> {
+    let candidate = prepare_state(root, state)?;
+    publish_state(root, &candidate)
+}
+
+/// Writes and syncs `state.tmp`, returning its path: the candidate [`publish_state`] renames.
+fn prepare_state(root: &Path, state: State) -> Result<PathBuf, Error> {
     let temporary = root.join("state.tmp");
+    let mut file = StdFile::create(&temporary).map_err(Error::io("create", &temporary))?;
+    write!(
+        file,
+        "mode={}\nclean={}\n",
+        mode_name(state.mode),
+        state.clean
+    )
+    .map_err(Error::io("write", &temporary))?;
+    file.sync_all().map_err(Error::io("fsync", &temporary))?;
+    Ok(temporary)
+}
+
+fn publish_state(root: &Path, candidate: &Path) -> Result<(), Error> {
     let destination = root.join("state");
-    {
-        let mut file = StdFile::create(&temporary).map_err(Error::io("create", &temporary))?;
-        write!(
-            file,
-            "mode={}\nclean={}\n",
-            mode_name(state.mode),
-            state.clean
-        )
-        .map_err(Error::io("write", &temporary))?;
-        file.sync_all().map_err(Error::io("fsync", &temporary))?;
-    }
-    std::fs::rename(&temporary, &destination).map_err(Error::io("rename", &destination))?;
+    std::fs::rename(candidate, &destination).map_err(Error::io("rename", &destination))?;
     sync_dir(root)
 }
 
@@ -1084,7 +1178,6 @@ fn open_blocking(root: PathBuf, options: Options) -> Result<Inner, Error> {
     std::fs::create_dir_all(&tmp).map_err(Error::io("create", &tmp))?;
     #[cfg(target_os = "linux")]
     let objects_dir = StdFile::open(&objects).map_err(Error::io("open", &objects))?;
-    let free_disk = sample_free_disk(&root);
     Ok(Inner {
         root,
         options,
@@ -1092,10 +1185,9 @@ fn open_blocking(root: PathBuf, options: Options) -> Result<Inner, Error> {
         validation: Mutex::new(()),
         ready: AtomicBool::new(false),
         closed: AtomicBool::new(false),
-        close_abandoned: AtomicBool::new(false),
+        close_decision: Mutex::new(CloseDecision::Pending),
         next_tmp: AtomicU64::new(0),
         background: AtomicU64::new(0),
-        free_disk: AtomicU64::new(free_disk),
         free_refreshing: AtomicBool::new(false),
         #[cfg(test)]
         hooks: Hooks::default(),
@@ -1267,11 +1359,18 @@ fn scan_blocking(inner: &Arc<Inner>) {
         }
     }
     *inner.index.lock().expect("index lock poisoned") = index;
-    inner.ready.store(true, Ordering::Release);
     refresh_free_disk(inner);
+    inner.ready.store(true, Ordering::Release);
 }
 
 fn close_blocking(inner: &Arc<Inner>) -> Result<(), Error> {
+    let result = close_steps(inner);
+    #[cfg(test)]
+    inner.hooks.close_done.store(true, Ordering::Release);
+    result
+}
+
+fn close_steps(inner: &Arc<Inner>) -> Result<(), Error> {
     // Writers, background tasks and reservations not yet in `write` must all be done;
     // spawning none from here on (the late touches below run inline).
     while inner.background.load(Ordering::Acquire) > 0
@@ -1280,10 +1379,13 @@ fn close_blocking(inner: &Arc<Inner>) -> Result<(), Error> {
         abandoned(inner)?;
         std::thread::sleep(Duration::from_millis(1));
     }
-    let late = {
-        let mut index = inner.index.lock().expect("index lock poisoned");
-        index.take_late_touches()
-    };
+    #[cfg(test)]
+    close_point(inner, ClosePoint::Drained);
+    let late = inner
+        .index
+        .lock()
+        .expect("index lock poisoned")
+        .late_touches();
     for (digest, when, generation) in late {
         touch(
             inner,
@@ -1293,30 +1395,54 @@ fn close_blocking(inner: &Arc<Inner>) -> Result<(), Error> {
             generation,
         );
     }
+    #[cfg(test)]
+    close_point(inner, ClosePoint::Touched);
     if inner.options.durability == Durability::PurgeOnCrash {
         syncfs_checked(inner)?;
     }
-    // Checked last: clean is written only if drained and synced before the deadline. A
-    // deadline landing during this write cannot make it untrue, only late.
-    abandoned(inner)?;
-    write_state(
+    #[cfg(test)]
+    close_point(inner, ClosePoint::Synced);
+    let candidate = prepare_state(
         &inner.root,
         State {
             mode: inner.options.durability,
             clean: true,
         },
-    )
+    )?;
+    #[cfg(test)]
+    close_point(inner, ClosePoint::Prepared);
+    // The decision and the rename are one step against a cancellation: once abandoned,
+    // nothing renames a clean state in, however late this thread gets here.
+    let mut decision = inner
+        .close_decision
+        .lock()
+        .expect("close decision poisoned");
+    if *decision == CloseDecision::Abandoned {
+        return Err(abandoned_error(inner));
+    }
+    publish_state(&inner.root, &candidate)?;
+    *decision = CloseDecision::Published;
+    Ok(())
 }
 
-/// Fails once [`Store::close`] was abandoned at the shutdown deadline.
+/// Fails once [`Store::close`] was abandoned (cancelled, or past the shutdown deadline).
 fn abandoned(inner: &Inner) -> Result<(), Error> {
-    if inner.close_abandoned.load(Ordering::Acquire) {
-        return Err(Error::io("close", &inner.root)(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "shutdown deadline passed; the run stays not clean",
-        )));
+    if *inner
+        .close_decision
+        .lock()
+        .expect("close decision poisoned")
+        == CloseDecision::Abandoned
+    {
+        return Err(abandoned_error(inner));
     }
     Ok(())
+}
+
+fn abandoned_error(inner: &Inner) -> Error {
+    Error::io("close", &inner.root)(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "close abandoned at the shutdown deadline; the run stays not clean",
+    ))
 }
 
 /// `syncfs` on the objects' file system, success checked (D32). Linux only: elsewhere a
@@ -3149,7 +3275,7 @@ mod tests {
         // Admitted on the stale sample; its commit re-samples after answering.
         put_vec(&store, &key("y"), vec![1; 10]).await;
         eventually("the sample to see the ballast", || {
-            store.inner.free_disk.load(Ordering::Acquire) < min_free_disk
+            store.inner.index.lock().unwrap().known_free_disk() < min_free_disk
         })
         .await;
         assert_eq!(
@@ -3242,6 +3368,160 @@ mod tests {
             contents(&reopened, &key("a")).await.as_deref(),
             Some(&b"aaaa"[..])
         );
+    }
+
+    // D12: until a sample covers it, every admitted reservation is debited from the known
+    // free space, so a stale sample never admits below `min_free_disk`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_free_sample_never_admits_below_min_free_disk() {
+        const SIXTEEN: u64 = 16 * MIB;
+        let dir = TempDir::new().unwrap();
+        let mut opts = options(1024 * MIB);
+        opts.min_free_disk = 1024 * MIB;
+        let store = Store::open(dir.path(), opts).await.unwrap();
+        ready(&store).await;
+        // Freeze the sample at room for one 16 MiB object, not two.
+        store
+            .inner
+            .hooks
+            .hold_free_disk
+            .store(true, Ordering::Release);
+        {
+            let mut index = store.inner.index.lock().unwrap();
+            let mark = index.free_disk_mark();
+            index.record_free_disk(1024 * MIB + 24 * MIB, mark);
+        }
+        let data = vec![1_u8; usize::try_from(SIXTEEN).unwrap()];
+        assert_eq!(put_vec(&store, &key("first"), data).await, Outcome::Stored);
+        let second = store.admit(&key("second"), SIXTEEN);
+        store
+            .inner
+            .hooks
+            .hold_free_disk
+            .store(false, Ordering::Release);
+        assert!(
+            matches!(second, Admission::Dropped(DropReason::NoSpace)),
+            "admitted below min_free_disk on a stale sample: {second:?}"
+        );
+    }
+
+    // A refused deletion retrying with backoff does not hold the runtime at exit once the
+    // store began closing, even if `close` never runs (the drain spent the deadline).
+    #[cfg(unix)]
+    #[test]
+    fn begin_close_bounds_exit_with_a_refused_unlink() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+        let dir = TempDir::new().unwrap();
+        let shard = object_path(dir.path(), &key("a").digest())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = Store::open(dir.path(), options(2 * BLOCK)).await.unwrap();
+            assert_eq!(put(&store, &key("a"), b"aaaa").await, Outcome::Stored);
+            std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(0o500)).unwrap();
+            // Storing `b` sweeps `a` out; its unlink is refused, and the backoff grows.
+            assert_eq!(put(&store, &key("b"), b"bbbb").await, Outcome::Stored);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                store.inner.index.lock().unwrap().pending,
+                BLOCK,
+                "the refused unlink was never exercised"
+            );
+            store.begin_close();
+        });
+        // Lets a failing run end instead of hanging: the refusal lifts after 1.5 s.
+        let restore = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(0o700)).unwrap();
+        });
+        let started = Instant::now();
+        drop(runtime);
+        let exit = started.elapsed();
+        restore.join().unwrap();
+        assert!(
+            exit < Duration::from_millis(200),
+            "runtime exit waited {exit:?} on a refused unlink"
+        );
+    }
+
+    // D32: a close cancelled at any point of its path never publishes `clean = true`,
+    // even once its blocking half reaches the publication.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_close_never_publishes_clean() {
+        for point in [
+            ClosePoint::Drained,
+            ClosePoint::Touched,
+            ClosePoint::Synced,
+            ClosePoint::Prepared,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+            assert_eq!(put(&store, &key("k"), b"data").await, Outcome::Stored);
+            *store.inner.hooks.pause_close_at.lock().unwrap() = Some(point);
+            let closing = {
+                let store = store.clone();
+                tokio::spawn(async move { store.close().await })
+            };
+            eventually("close to reach the point", || {
+                store.inner.hooks.close_reached.load(Ordering::Acquire)
+            })
+            .await;
+            closing.abort();
+            assert!(closing.await.is_err(), "close finished at {point:?}");
+            store
+                .inner
+                .hooks
+                .close_release
+                .store(true, Ordering::Release);
+            eventually("the blocking close to return", || {
+                store.inner.hooks.close_done.load(Ordering::Acquire)
+            })
+            .await;
+            let state = std::fs::read_to_string(dir.path().join("state")).unwrap();
+            assert!(
+                state.contains("clean=false"),
+                "a close cancelled at {point:?} published: {state}"
+            );
+        }
+    }
+
+    // D14: a touch whose `mtime` write fails is not persisted; `close` writes it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_touch_is_retried_by_close() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let mut opts = options(MIB);
+        opts.touch_interval = Duration::ZERO;
+        let store = Store::open(dir.path(), opts).await.unwrap();
+        assert_eq!(put(&store, &key("a"), b"aaaa").await, Outcome::Stored);
+        let path = object_path(dir.path(), &key("a").digest());
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        StdFile::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(contents(&store, &key("a")).await.is_some());
+        eventually("the refused touch", || {
+            store.inner.background.load(Ordering::Acquire) == 0
+        })
+        .await;
+        let refused = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        store.close().await.unwrap();
+        let closed = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(refused, old, "the touch was never refused");
+        assert!(closed > old, "close did not retry the failed touch");
     }
 
     // A close dropped at the shutdown deadline never writes `clean = true` (D32), even

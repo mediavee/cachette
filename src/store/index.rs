@@ -63,8 +63,10 @@ pub(super) struct Entry {
     pub(super) modified: SystemTime,
     /// Last hit in memory; ahead of `modified` until the next persisted touch.
     pub(super) last_access: SystemTime,
-    /// Last recency written back to `mtime`.
+    /// Last recency written back to `mtime`, advanced only once the write succeeded.
     pub(super) last_persisted: SystemTime,
+    /// A recency touch was handed out and has not settled: no second one until it does.
+    touch_in_flight: bool,
     newer: u32,
     older: u32,
 }
@@ -100,6 +102,13 @@ pub(super) struct Index {
     /// Keys with a PUT in flight, by digest, with their reservation count. Never evictable.
     pins: DigestMap<u32>,
     next_generation: u64,
+    /// Free disk bytes at the last `statvfs` (D12).
+    free_disk: u64,
+    /// Charged bytes ever admitted: a monotonic counter.
+    admitted: u64,
+    /// `admitted` minus the reservations in flight when the last sample was taken: every
+    /// byte admitted beyond it may be missing from that sample, so it is debited.
+    sampled_admitted: u64,
 }
 
 impl Index {
@@ -115,7 +124,37 @@ impl Index {
             pending: 0,
             pins: DigestMap::default(),
             next_generation: 1,
+            free_disk: 0,
+            admitted: 0,
+            sampled_admitted: 0,
         }
+    }
+
+    /// Free disk bytes the store may still count on: the last sample, minus every
+    /// reservation admitted since it or in flight when it was taken (D12). A stale sample
+    /// can only under-count, never let an admission below `min_free_disk`.
+    pub(super) fn known_free_disk(&self) -> u64 {
+        let unseen = self.admitted.saturating_sub(self.sampled_admitted);
+        self.free_disk.saturating_sub(unseen)
+    }
+
+    /// Debits an admitted reservation from the known free space.
+    pub(super) fn reserve(&mut self, charged: u64) {
+        self.reserved = self.reserved.saturating_add(charged);
+        self.admitted = self.admitted.saturating_add(charged);
+    }
+
+    /// What a sample about to be taken will have seen: everything admitted and no longer
+    /// in flight. Read under the lock before `statvfs`, passed back to `record_free_disk`.
+    pub(super) fn free_disk_mark(&self) -> u64 {
+        self.admitted.saturating_sub(self.reserved)
+    }
+
+    /// Installs a sample taken after `mark` was read. Samples may land out of order: each
+    /// one stays conservative against its own mark, so the last to land is safe to keep.
+    pub(super) fn record_free_disk(&mut self, free: u64, mark: u64) {
+        self.free_disk = free;
+        self.sampled_admitted = mark;
     }
 
     pub(super) fn entries(&self) -> u64 {
@@ -166,12 +205,12 @@ impl Index {
         self.move_to_head(slot);
         let entry = self.slot_mut(slot)?;
         entry.last_access = now;
-        let due = now
-            .duration_since(entry.last_persisted)
-            .is_ok_and(|age| age >= touch_interval);
+        let due = !entry.touch_in_flight
+            && now
+                .duration_since(entry.last_persisted)
+                .is_ok_and(|age| age >= touch_interval);
         let persist_recency = if due {
-            entry.last_persisted = now;
-            entry.modified = now;
+            entry.touch_in_flight = true;
             Some(now)
         } else {
             None
@@ -208,6 +247,7 @@ impl Index {
                 entry.modified = modified;
                 entry.last_access = modified;
                 entry.last_persisted = modified;
+                entry.touch_in_flight = false;
             }
             return generation;
         }
@@ -219,6 +259,7 @@ impl Index {
             modified,
             last_access: modified,
             last_persisted: modified,
+            touch_in_flight: false,
             newer: NONE,
             older: NONE,
         };
@@ -281,18 +322,42 @@ impl Index {
         self.slot(self.tail).map(|entry| entry.last_access)
     }
 
-    /// Every entry whose in-memory recency was never persisted, marked persisted. The caller
-    /// writes the `mtime`s outside the lock; used at a clean shutdown (D14).
-    pub(super) fn take_late_touches(&mut self) -> Vec<(Digest, SystemTime, u64)> {
-        let mut late = Vec::new();
-        for entry in self.slots.iter_mut().flatten() {
-            if entry.last_access > entry.last_persisted {
-                entry.last_persisted = entry.last_access;
-                entry.modified = entry.last_access;
-                late.push((entry.digest, entry.last_access, entry.generation));
-            }
+    /// Every entry whose in-memory recency is not persisted yet, with its generation. The
+    /// caller writes the `mtime`s outside the lock and settles each; used at a clean
+    /// shutdown (D14).
+    pub(super) fn late_touches(&self) -> Vec<(Digest, SystemTime, u64)> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|entry| entry.last_access > entry.last_persisted)
+            .map(|entry| (entry.digest, entry.last_access, entry.generation))
+            .collect()
+    }
+
+    /// Ends a touch of `generation`: `persisted` is the `mtime` written, or `None` when the
+    /// write failed or did not apply, which leaves the access late for `close` to retry.
+    pub(super) fn touch_settled(
+        &mut self,
+        digest: Digest,
+        generation: u64,
+        persisted: Option<SystemTime>,
+    ) {
+        let Some(&slot) = self.map.get(&digest) else {
+            return;
+        };
+        let Some(entry) = self.slot_mut(slot) else {
+            return;
+        };
+        if entry.generation != generation {
+            return;
         }
-        late
+        entry.touch_in_flight = false;
+        if let Some(when) = persisted
+            && when > entry.last_persisted
+        {
+            entry.last_persisted = when;
+            entry.modified = when;
+        }
     }
 
     /// Whether a recency touch decided for `generation` at `when` still applies: the
@@ -438,15 +503,20 @@ mod tests {
             .hit(digest(1), at(500), Duration::from_secs(300))
             .expect("hit");
         assert_eq!(hit.persist_recency, Some(at(500)));
-        // A late hit inside the interval is flushed by take_late_touches, once.
-        assert!(
-            index
-                .hit(digest(1), at(600), Duration::from_secs(300))
-                .is_some()
-        );
-        assert_eq!(index.take_late_touches(), [(digest(1), at(600), 1)]);
+        // In flight: no second touch, and nothing counts as persisted until it settles.
+        let hit = index.hit(digest(1), at(900), Duration::ZERO).expect("hit");
+        assert_eq!(hit.persist_recency, None);
+        assert_eq!(index.late_touches(), [(digest(1), at(900), 1)]);
+        index.touch_settled(digest(1), 1, Some(at(500)));
+        assert_eq!(index.peek(digest(1)).map(|(_, m)| m), Some(at(500)));
+        // A failed touch leaves the access late, for close to retry.
+        let hit = index.hit(digest(1), at(1000), Duration::ZERO).expect("hit");
+        assert_eq!(hit.persist_recency, Some(at(1000)));
+        index.touch_settled(digest(1), 1, None);
+        assert_eq!(index.late_touches(), [(digest(1), at(1000), 1)]);
+        index.touch_settled(digest(1), 1, Some(at(1000)));
         assert_eq!(
-            index.take_late_touches(),
+            index.late_touches(),
             Vec::<(Digest, SystemTime, u64)>::new()
         );
     }

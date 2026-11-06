@@ -88,12 +88,15 @@ async fn run(config: Config) -> anyhow::Result<()> {
     );
 
     // Stamp when the signal lands: the shutdown timeout bounds the drain and the store's
-    // close together, measured from there.
+    // close together, measured from there. The store starts closing at once, so its
+    // retries stop even if the drain spends the whole deadline and `close` never runs.
     let shutdown_at = Arc::new(Mutex::new(None));
     let stamped = {
         let shutdown_at = Arc::clone(&shutdown_at);
+        let store = store.clone();
         async move {
             shutdown.await;
+            store.begin_close();
             *shutdown_at.lock().expect("shutdown stamp poisoned") = Some(Instant::now());
         }
     };
@@ -114,10 +117,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
     } else if let Ok(closed) = tokio::time::timeout(remaining, store.close()).await {
         closed.context("cannot flush the store")?;
     } else {
-        warn!(
-            timeout = ?config.shutdown_timeout,
-            "shutdown deadline missed while closing the store; leaving it not clean"
-        );
+        // The dropped close logs whether it was abandoned or had already published.
+        warn!(timeout = ?config.shutdown_timeout, "shutdown deadline reached while closing the store");
     }
     info!("stopped");
     Ok(())
