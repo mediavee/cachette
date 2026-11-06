@@ -30,8 +30,8 @@ def command(*args, **kwargs):
 
 def preflight(max_load):
     load = os.getloadavg()
-    if max(load) > max_load:
-        raise RuntimeError(f"Refusing: load averages {load} exceed {max_load}")
+    if load[0] > max_load:
+        raise RuntimeError(f"Refusing: 1-minute load {load[0]} exceeds {max_load} (1/5/15 min: {load})")
     for port in PORTS.values():
         with socket.socket() as sock:
             try:

@@ -20,8 +20,9 @@ for each server. `--seconds`, `--cap-mib` (default 256), `--max-load` (default 2
 and `--results` are explicit overrides, recorded in the generated report.
 The default three-server matrix takes at least 18 minutes, excluding builds.
 Run only when the shared host is quiet; the preflight rejects any of the three
-occupied TCP ports and any 1/5/15-minute load average above the threshold,
-including after building. If compilation raised the load, let it settle and
+occupied TCP ports and a 1-minute load average above the threshold,
+including after building. The 5/15-minute historical averages are recorded,
+not used to reject a currently quiet host. If compilation raised the load, let it settle and
 replay the same command (Docker reuses the build cache). There is no automatic
 load-threshold bypass. CPU load is not a disk-I/O isolation guarantee.
 

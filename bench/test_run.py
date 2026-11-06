@@ -17,7 +17,11 @@ class GuardTests(unittest.TestCase):
     def test_high_load_refused_before_docker(self):
         result = self.cli(f'import os, runpy, sys; os.getloadavg=lambda: (3, 0, 0); sys.argv=[{str(RUN)!r}, "--preflight-only"]; runpy.run_path({str(RUN)!r}, run_name="__main__")')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("load averages", result.stderr)
+        self.assertIn("1-minute load", result.stderr)
+
+    def test_historical_load_does_not_reject_a_quiet_host(self):
+        result = self.cli(f'import os, runpy, sys; os.getloadavg=lambda: (0.1, 4, 4); sys.argv=[{str(RUN)!r}, "--preflight-only"]; runpy.run_path({str(RUN)!r}, run_name="__main__")')
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_occupied_port_refused_before_docker(self):
         with socket.socket() as sock:
