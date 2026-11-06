@@ -189,7 +189,7 @@ impl Metrics {
         self.inner.written_bytes.increment(bytes);
     }
 
-    /// Records a PUT that was answered 200 without being stored.
+    /// Records a PUT that was not stored.
     pub(crate) fn put_dropped(&self, reason: DropReason) {
         let slot = DropReason::ALL.iter().position(|known| *known == reason);
         if let Some(counter) = slot.and_then(|slot| self.inner.puts_dropped.get(slot)) {
@@ -256,10 +256,7 @@ fn describe() {
         "Object bytes sent to clients"
     );
     describe_counter!(WRITTEN_BYTES_TOTAL, Unit::Bytes, "Object bytes stored");
-    describe_counter!(
-        PUTS_DROPPED_TOTAL,
-        "PUTs answered 200 but not stored, by reason"
-    );
+    describe_counter!(PUTS_DROPPED_TOTAL, "PUTs not stored, by reason");
     describe_counter!(
         AUTH_FAILURES_TOTAL,
         "Requests refused for missing or invalid credentials"

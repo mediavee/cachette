@@ -66,7 +66,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
       - name: Default and SCCACHE_WEBDAV_DISABLE_CREATE_DIR
-        run: tests/clients/sccache/run.sh
+        run: tests/clients/sccache/run.sh default no-create-dir
+      - name: Objects over max_object_size get a 413 and the build goes on
+        run: tests/clients/sccache/run.sh drop
       - name: Control, empty server must fail
         run: |
           if CLIENTS_SKIP_WARMUP=1 tests/clients/sccache/run.sh default >control.log 2>&1; then
@@ -74,3 +76,11 @@ jobs:
           fi
           grep -q 'zero sccache hits' control.log || { cat control.log; echo "failed for another reason"; exit 1; }
           echo "control failed as expected: $(grep 'zero sccache hits' control.log)"
+      # A limit that splits nothing must fail the drop scenario, or its pass proves nothing.
+      - name: Control, a limit that drops nothing must fail
+        run: |
+          if DROP_MAX_OBJECT_SIZE=64MiB tests/clients/sccache/run.sh drop >control-drop.log 2>&1; then
+            cat control-drop.log; echo "the control passed without a single 413"; exit 1
+          fi
+          grep -q 'objects dropped with a 413: got 0' control-drop.log || { cat control-drop.log; echo "failed for another reason"; exit 1; }
+          echo "control failed as expected: $(grep 'objects dropped with a 413' control-drop.log)"

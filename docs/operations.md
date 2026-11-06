@@ -11,7 +11,7 @@ At start the server scans `objects/` to rebuild its index. The time grows with t
 objects. While it runs:
 
 - reads are served straight from disk,
-- PUTs are not stored. They answer `200` and count under `reason="not_ready"` (see
+- PUTs are not stored. They answer `413` (`200` to Gradle) and count under `reason="not_ready"` (see
   [protocol](protocol.md#a-put-the-server-does-not-store)).
 
 Wait for `200` before sending a build to a freshly started server. The image has no shell and no
@@ -32,7 +32,7 @@ Every name below is defined in [`src/metrics.rs`](../src/metrics.rs).
 | `cachette_misses_total` | counter | | `GET`s that did not. |
 | `cachette_read_bytes_total` | counter | | Object bytes sent to clients. |
 | `cachette_written_bytes_total` | counter | | Object bytes that became visible in the store. |
-| `cachette_puts_dropped_total` | counter | `reason` | PUTs answered `200` and not stored. `reason` is `too_large`, `no_space`, `not_ready` or `io`. All four exist at zero from the start. |
+| `cachette_puts_dropped_total` | counter | `reason` | PUTs not stored, answered `413` (`200` to Gradle). `reason` is `too_large`, `no_space`, `not_ready` or `io`. All four exist at zero from the start. |
 | `cachette_auth_failures_total` | counter | | Requests refused with `401`, and `/metrics` scrapes with a wrong token. A `403` (valid token, no right to write) is not counted. |
 | `cachette_evictions_total` | counter | | Entries evicted to make room. |
 | `cachette_evicted_bytes_total` | counter | | Bytes those evictions freed. |

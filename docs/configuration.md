@@ -38,7 +38,7 @@ Durations read `10s`, `5m`, `2h`, `1h30m`. A unit is required: `90` is refused, 
 | `listen` | `CACHETTE_LISTEN` | `--listen` | `127.0.0.1:5071` | Address to listen on. Port `0` picks a free port: the first line on stdout is then `listening <scheme>://<addr>`. |
 | `data_dir` | `CACHETTE_DATA_DIR` | `--data-dir` | `data` (relative to the working directory) | The cache directory. See [Data directory](#data-directory). |
 | `max_size` | `CACHETTE_MAX_SIZE` | `--max-size` | none, **required** | Ceiling for stored objects, uploads in flight and evicted objects not yet deleted. Each is rounded up to 4 KiB. |
-| `max_object_size` | `CACHETTE_MAX_OBJECT_SIZE` | `--max-object-size` | `512MiB`, or `max_size` if smaller | Largest accepted object. A bigger PUT is not stored but still answers `200`. Never above `max_size`. |
+| `max_object_size` | `CACHETTE_MAX_OBJECT_SIZE` | `--max-object-size` | `512MiB`, or `max_size` if smaller | Largest accepted object. A bigger PUT is not stored and answers `413`, or `200` to Gradle ([why](protocol.md#a-put-the-server-does-not-store)). Never above `max_size`. |
 | `min_free_disk` | `CACHETTE_MIN_FREE_DISK` | `--min-free-disk` | `1GiB` | Free space the filesystem must keep. A PUT that would eat into it is dropped. |
 | `durability` | `CACHETTE_DURABILITY` | `--durability` | `purge-on-crash` on Linux, `fsync` elsewhere | What a crash costs. `purge-on-crash` or `fsync`. See [operations](operations.md#durability-purge-on-crash-or-fsync). |
 | `touch_interval` | `CACHETTE_TOUCH_INTERVAL` | `--touch-interval` | `5m` | Minimum delay between two writes of one entry's recency to disk. An entry read more often is written once per interval. |
@@ -142,7 +142,7 @@ duration in microseconds and token name:
 
 | Value | Logged |
 |---|---|
-| `errors` (default) | Failures, refusals (`401`, `403`), client errors other than `404`, and PUTs answered `200` without being stored. |
+| `errors` (default) | Failures, refusals (`401`, `403`), client errors other than `404`, and PUTs that are not stored. |
 | `all` | Every request. A line per hit costs a syscall: for debugging. |
 | `off` | Only server errors, refused credentials and dropped PUTs. |
 
