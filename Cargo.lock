@@ -277,11 +277,13 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "bytesize",
  "clap",
  "futures-util",
+ "httpdate",
  "humantime",
  "hyper",
  "hyper-util",

@@ -76,11 +76,13 @@ enum_glob_use = "allow"                  # use Enum::* inside a function that ma
 [dependencies]
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 blake3 = "1.8.7"
 bytes = "1.12.1"
 bytesize = "2.7.0"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures-util = { version = "0.3.34", default-features = false }
+httpdate = "1.0.3"
 humantime = "2.4.0"
 hyper = { version = "1.12.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server", "http1", "service", "server-graceful"] }

@@ -3,6 +3,13 @@
 //! Every process gets its own data directory, its own `HOME`, and port 0, so tests run in
 //! parallel and never touch a fixed port or the developer's files.
 
+#![expect(
+    dead_code,
+    reason = "every test crate includes the whole harness and uses the part it needs"
+)]
+
+pub(crate) mod wire;
+
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -217,6 +224,18 @@ impl Daemon {
         self.request("GET", path, &[])
     }
 
+    /// The value of the metric series `series` (name and labels, as scraped), or 0 when the
+    /// series does not exist yet.
+    pub(crate) fn metric(&self, series: &str) -> f64 {
+        let scrape = self.get("/metrics");
+        assert_eq!(scrape.status, 200, "scrape failed: {}", scrape.body);
+        scrape
+            .body
+            .lines()
+            .find_map(|line| line.strip_prefix(series)?.trim().parse().ok())
+            .unwrap_or(0.0)
+    }
+
     /// One request on a fresh connection, closed after the response.
     pub(crate) fn request(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> Response {
         try_request(self.addr, method, path, headers)
@@ -225,12 +244,17 @@ impl Daemon {
 
     /// Sends SIGTERM and waits for the process to exit.
     pub(crate) fn terminate(&mut self, within: Duration) -> ExitStatus {
+        self.sigterm();
+        self.wait(within)
+    }
+
+    /// Sends SIGTERM and returns at once.
+    pub(crate) fn sigterm(&self) {
         let status = Command::new("kill")
             .args(["-TERM", &self.child.id().to_string()])
             .status()
             .expect("run kill");
         assert!(status.success(), "kill -TERM failed");
-        self.wait(within)
     }
 
     /// Waits for the process to exit by itself.
