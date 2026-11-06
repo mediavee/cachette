@@ -1,0 +1,6 @@
+# The root .dockerignore keeps the release image context to the published binaries; this build
+# compiles from source, so it needs the crate and nothing else.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
