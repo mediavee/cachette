@@ -103,10 +103,15 @@ include unrelated workloads and Tailscale and do not attribute CPU to the server
 cachette builds from the current checkout as a static musl binary in
 `cachette.Dockerfile`, using the repository's release profile and allocator
 (D39), packaged in scratch. The runner does not override workers, allocator,
-TCP settings or release flags to improve results. TOML uses `durability`, not
+TCP settings or release flags to improve results. The builder compiles with
+two jobs and copies only Cargo manifests and `src/`, excluding host build outputs
+and benchmark reports from its inputs. TOML uses `durability`, not
 the removed `fsync` boolean. Each mode gets fresh storage and an explicitly
-labelled table cell. This build/config/start path remains unverified until the
-real runtime is merged; no cachette figures are fabricated.
+labelled table cell. The musl build and both configurations were smoke-tested against the foundation
+at source `7ab6586`: the scratch image returns 200 on `/healthz` in each mode,
+and the legacy `fsync` field is rejected with exit 1. This validates build,
+configuration and startup only. The real blob store/HTTP path remains unverified;
+no cachette performance figures are fabricated.
 
 - oha **1.14.0**, commit `9766ca2b725b69b7606b99861d01c779b4aeb65d`, locked build.
 - fosterstack `31e69559cde78277192281173176a9e25d13a3bb`, vendored dependencies,
@@ -178,6 +183,24 @@ results belong to the clients lot; D30 remains unproven here.
 The historical successful reports retain their original source/configuration
 and measurements, with raw evidence consolidated into each Markdown file:
 
+- [Expanded 4 GiB matrix, 5 s](results/2026-11-06T181342Z-dev2.md):
+  exit 0 on pushed source `c557b0bb45230633bac544edfd73d2b1951eb00f`;
+  144 measurements including 64 KiB, six positive RSS peaks and three pressure
+  traces. Ten of 72 pairs exceed ±10% (four nginx, two foster, four bazel): nine
+  PUT and one nginx 32 MiB GET/c16. All GET pairs through 1 MiB meet the tolerance
+  in this run. No HTTP/transport errors for nginx/bazel; foster returns 429 in
+  PUT/c64. All 1152 pressure PUTs are 2xx. Initial dev2 load was 1.03; load rose
+  during the run and is retained per point (final 26.65). No cause is established
+  for variation; these shared-host results do not justify a stable PUT ranking.
+  The final renderer fixes table formatting without changing raw observations.
+
+  The mini→dev2 timed run was refused: mini load 34.13 exceeded the default 2
+  on 2026-11-06. No network throughput/CPU benchmark result is published. The
+  remote replay command above remains required when both machines are quiet.
+  Functional startup probes did confirm that each competitor binds only dev2's
+  Tailscale IPv4 and serves a 4 KiB GET to the mini (200); bazel's body matched
+  its CAS key. They intentionally stop before timed load and publish no benchmark
+  result. Their diagnostic failure reports remain outside the repository.
 - [4 GiB, three servers, 5 s](results/2026-11-06T174832Z-dev2.md): 108 measurements,
   all GET repeat pairs within ±10%; 10/54 points unstable, all PUT. No timed HTTP
   errors for nginx/bazel; foster predominantly 429 at PUT/c64. All 1152 pressure
