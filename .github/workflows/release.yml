@@ -1,0 +1,260 @@
+name: Release
+
+# A `v*` tag builds, publishes and releases. Everything else only builds: a manual run, or a pull
+# request that touches the packaging, so that a broken release is found before the tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Dockerfile
+      - .dockerignore
+
+permissions:
+  contents: read
+
+# A tag run is never cancelled half-way: it could leave an image without its release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/mediavee/cachette
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      latest: ${{ steps.plan.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          crate="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          if [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ]; then
+            version="${REF_NAME#v}"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
+              || { echo "::error::tag $REF_NAME is not vMAJOR.MINOR.PATCH[-prerelease]"; exit 1; }
+            # `cachette --version` reads Cargo.toml: a tag that disagrees would ship a binary that lies.
+            [ "$version" = "$crate" ] \
+              || { echo "::error::tag $REF_NAME but Cargo.toml says version $crate"; exit 1; }
+            publish=true
+            # A prerelease never takes `latest`.
+            case "$version" in *-*) latest=false ;; *) latest=true ;; esac
+          else
+            version="$crate"
+            publish=false
+            latest=false
+          fi
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "latest=$latest"
+          } >> "$GITHUB_OUTPUT"
+
+  # Native builds on GitHub-hosted runners, one per target: no cross-compilation toolchain to keep
+  # up to date, and each binary is run once on the CPU it is built for.
+  build:
+    name: build (${{ matrix.target }})
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            musl: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            musl: false
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup toolchain install stable --profile minimal --target "$TARGET"
+      # No build cache: a release is built from the sources and the lockfile alone.
+      - name: Build
+        env:
+          # cc-rs would otherwise look for a `<arch>-linux-musl-gcc` that musl-tools does not install;
+          # the C of mimalloc and ring must be compiled against musl, not glibc.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Check the binary is static
+        if: matrix.musl
+        run: |
+          bin="target/$TARGET/release/cachette"
+          file "$bin"
+          # Rust's musl targets link static-pie, which older `file` words as "static-pie linked".
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          # `!` does not trip `-e`, hence the explicit test.
+          if readelf -d "$bin" | grep -q NEEDED; then
+            echo "::error::$bin needs shared libraries"
+            exit 1
+          fi
+      - name: Smoke test
+        run: |
+          bin="$PWD/target/$TARGET/release/cachette"
+          [ "$("$bin" --version)" = "cachette $VERSION" ]
+          dir="$RUNNER_TEMP/smoke"
+          mkdir -p "$dir"
+          CACHETTE_LISTEN=127.0.0.1:0 CACHETTE_DATA_DIR="$dir/data" CACHETTE_MAX_SIZE=1GiB \
+            CACHETTE_ANONYMOUS=read "$bin" > "$dir/stdout" 2> "$dir/stderr" &
+          pid=$!
+          addr=
+          for _ in $(seq 50); do
+            addr="$(sed -n 's|^listening ||p' "$dir/stdout")"
+            [ -n "$addr" ] && break
+            sleep 0.2
+          done
+          [ -n "$addr" ] || { cat "$dir/stderr"; kill "$pid"; exit 1; }
+          curl -fsS --retry 10 --retry-delay 1 --retry-connrefused "$addr/healthz"
+          echo
+          # SIGTERM must end in a clean exit: the systemd unit restarts on failure only.
+          kill -TERM "$pid"
+          wait "$pid"
+      - name: Package
+        run: |
+          name="cachette-$VERSION-$TARGET"
+          mkdir "$name"
+          cp "target/$TARGET/release/cachette" LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: archive-${{ matrix.target }}
+          path: cachette-${{ needs.plan.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  image:
+    name: image
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: archive-*-linux-musl
+          path: archives
+          merge-multiple: true
+      # The image holds the published binaries themselves, not a rebuild of them.
+      - name: Unpack the binaries for the Dockerfile
+        run: |
+          unpack() {
+            mkdir -p "dist/$1"
+            tar -xzf "archives/cachette-$VERSION-$2.tar.gz" -C "dist/$1" --strip-components=1 \
+              "cachette-$VERSION-$2/cachette"
+          }
+          unpack amd64 x86_64-unknown-linux-musl
+          unpack arm64 aarch64-unknown-linux-musl
+      - uses: docker/setup-buildx-action@v4
+      - if: needs.plan.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the amd64 image to run it
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: cachette:smoke
+          provenance: false
+      - name: Smoke test the image
+        run: |
+          docker run -d --name smoke -p 127.0.0.1::5071 \
+            -e CACHETTE_MAX_SIZE=1GiB -e CACHETTE_ANONYMOUS=read cachette:smoke
+          addr="$(docker port smoke 5071/tcp | head -n 1)"
+          [ "$(docker inspect -f '{{.Config.User}}' cachette:smoke)" = 65532:65532 ]
+          curl -fsS --retry 10 --retry-delay 1 --retry-connrefused "http://$addr/healthz" \
+            || { docker logs smoke; exit 1; }
+          echo
+          docker stop smoke
+          [ "$(docker inspect -f '{{.State.ExitCode}}' smoke)" = 0 ] \
+            || { docker logs smoke; exit 1; }
+      - name: Tags
+        id: tags
+        env:
+          LATEST: ${{ needs.plan.outputs.latest }}
+        run: |
+          {
+            echo "list<<EOF"
+            echo "$IMAGE:$VERSION"
+            [ "$LATEST" = true ] && echo "$IMAGE:latest"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      # Without `push`, this still builds both architectures: a dry run proves the arm64 image too.
+      - name: Build the multi-arch image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.plan.outputs.publish == 'true' }}
+          tags: ${{ steps.tags.outputs.list }}
+          labels: org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+          provenance: false
+
+  release:
+    name: release
+    # After the image, so that a release that exists points at an image that exists.
+    needs: [plan, build, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: archive-*
+          path: release
+          merge-multiple: true
+      - name: Checksums
+        working-directory: release
+        run: |
+          sha256sum -- *.tar.gz | tee SHA256SUMS
+          [ "$(wc -l < SHA256SUMS)" = 3 ]
+      # A dry run stops here, with the files to inspect.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-files
+          path: release/*
+          if-no-files-found: error
+      - name: Publish the GitHub release
+        if: needs.plan.outputs.publish == 'true'
+        env:
+          TAG: ${{ github.ref_name }}
+          LATEST: ${{ needs.plan.outputs.latest }}
+        run: |
+          flags=()
+          [ "$LATEST" = true ] || flags+=(--prerelease)
+          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes "${flags[@]}" \
+            release/*.tar.gz release/SHA256SUMS
