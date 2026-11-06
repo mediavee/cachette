@@ -84,9 +84,9 @@ The pressure workload itself bounds its data to 3× the cap. nginx uses sendfile
 automatic workers and no access log. Container log collection is disabled for
 all four; application-side formatting costs can still differ.
 
-
 bazel-remote uses the official image for [v2.6.4](https://github.com/buchgr/bazel-remote/releases/tag/v2.6.4),
-the latest published release verified on 2026-11-06. `BAZEL_IMAGE` in `run.py`
+the latest published release verified on 2026-11-06. Select it as `bazel` in
+`--servers`. `BAZEL_IMAGE` in `run.py`
 pins that release's Linux amd64 manifest by digest, also retained in the report.
 Its HTTP keys are `/cas/<sha256 of body>`; both seed readback and the pressure
 workload use valid content addresses. Repeated CAS uploads may have different
@@ -150,6 +150,22 @@ readback and the separate pressure evidence establish the behavior observed.
 
 ### Recorded dev2 runs
 
+- [Complete three-server run, 4 GiB, 5 s per point](results/2026-11-06T174832Z-dev2.md):
+  exit 0 on source head `1b02c456ca1be7b1411f292d30a1892a44327d04`;
+  108 measurements, three pressure traces and six RSS sample sets. All bazel
+  and nginx timed requests returned 2xx; fosterstack still returns predominantly
+  429 for PUT at concurrency 64 with its default 32-upload bound. All 1152
+  pressure PUTs returned 2xx. Ten of 54 repeated points exceed ±10% (two bazel,
+  five nginx, three fosterstack), all in PUT. All GET pairs meet that throughput
+  tolerance in this run. The overall stability target remains unmet and the
+  cause of the PUT variation is not established; the setup's confounders above
+  still apply. No stable ranking is claimed for those PUT points.
+
+  Replay this workload with the current default cap:
+
+  ```sh
+  sudo timeout 3600 python3 -B bench/run.py --servers bazel nginx foster --seconds 5 --work-dir /home/debian/cachette-bench
+  ```
 - [Capacity-constrained three-server run, 1 GiB, 5 s per point](results/2026-11-06T173458Z-dev2.md):
   exit 0 on source head `667d95b02d061271964c8ba3671561ad5a1b2d3c`;
   108 measurements, three pressure traces and six RSS sample sets. Seven of
@@ -173,7 +189,7 @@ readback and the separate pressure evidence establish the behavior observed.
   incomplete. The current block sampler handles this race; this report remains
   explicitly partial and is not a second successful full run.
 
-In the complete run, fosterstack PUT at concurrency 64 returns predominantly
+In the complete runs, fosterstack PUT at concurrency 64 returns predominantly
 429. Its high response rate and low all-response latencies must not be read as
 successful storage performance; use the error and useful MiB/s columns together.
 The default 32-upload admission bound is retained, not tuned for this benchmark.
