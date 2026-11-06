@@ -73,6 +73,14 @@ class DiskSamplingTests(unittest.TestCase):
                     run.allocated_bytes(Path(directory))
 
 
+class DataDirectoryTests(unittest.TestCase):
+    def test_bazel_starts_with_an_empty_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "data"
+            run.prepare_data("bazel", root)
+            self.assertEqual(list(root.iterdir()), [])
+
+
 class BazelCASTests(unittest.TestCase):
     def setUp(self):
         self.objects = {}

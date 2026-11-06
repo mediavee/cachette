@@ -65,6 +65,13 @@ def pressure_put(server, number, payload):
     return request(server, "PUT", object_key(server, body, f"pressure-{number}"), body)[0]
 
 
+def prepare_data(server, path):
+    path.mkdir()
+    if server != "bazel":
+        (path / "objects").mkdir()
+        (path / "tmp").mkdir()
+
+
 def statistics(data):
     statuses = data["statusCodeDistribution"]
     transport = sum(data["errorDistribution"].values())
@@ -161,9 +168,7 @@ def main():
         for server in args.servers:
             print(f"Measuring {server}", flush=True)
             data = run_dir / "data"
-            data.mkdir()
-            (data / "objects").mkdir()
-            (data / "tmp").mkdir()
+            prepare_data(server, data)
             config = run_dir / "cachette.toml"
             config.write_text(f'data_dir = "/data"\nmax_size = "{args.cap_mib}MiB"\nmax_object_size = "64MiB"\nmin_free_disk = "1GiB"\nfsync = true\n[[tokens]]\nname = "bench"\nsecret = "{TOKEN}"\naccess = "write"\n')
             name = f"cachette-bench-{server}"
@@ -254,9 +259,7 @@ def main():
             command("docker", "rm", "-f", name)
             containers.remove(name)
             shutil.rmtree(data)
-            data.mkdir()
-            (data / "objects").mkdir()
-            (data / "tmp").mkdir()
+            prepare_data(server, data)
             containers.append(name)
             command(*start)
             time.sleep(1)
