@@ -126,6 +126,32 @@ class BazelCASTests(unittest.TestCase):
         self.assertEqual({len(body) for body in self.objects.values()}, {32})
 
 
+class MatrixTests(unittest.TestCase):
+    def test_size_boundary_and_both_durability_modes(self):
+        self.assertEqual(run.SIZES, [4096, 65536, 1048576, 33554432])
+        self.assertEqual(run.variants(["cachette", "nginx"]),
+                         [("cachette", "purge-on-crash"), ("cachette", "fsync"), ("nginx", "no fsync")])
+        for mode in ["purge-on-crash", "fsync"]:
+            config = run.cachette_config(4096, mode)
+            self.assertIn(f'durability = "{mode}"', config)
+            self.assertNotIn("fsync =", config)
+
+    def test_rss_includes_master_and_each_worker(self):
+        self.assertEqual(run.process_rss("PID RSS\n100 1024\n101 2048\n102 4096"), 7168)
+
+    def test_network_client_refuses_high_load(self):
+        from network import require_quiet
+        with patch("os.getloadavg", return_value=(3, 0, 0)):
+            with self.assertRaisesRegex(RuntimeError, "Refusing client"):
+                require_quiet(2)
+        with patch("os.getloadavg", return_value=(0.1, 4, 4)):
+            self.assertEqual(require_quiet(2), (0.1, 4, 4))
+
+    def test_cpu_percentage_uses_counter_deltas(self):
+        from network import cpu_busy
+        self.assertEqual(cpu_busy((100, 50), (300, 100)), 75)
+
+
 class ReportTests(unittest.TestCase):
     def test_http_and_transport_failures_do_not_inflate_goodput(self):
         evidence = {
@@ -138,7 +164,7 @@ class ReportTests(unittest.TestCase):
                    repeat=1, peak_rss_kib=0, oha=evidence)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report.md"
-            run.render(path, Path("raw.json"), {"utc": "fixture", "host": "fixture"},
+            run.render(path, {"utc": "fixture", "host": "fixture"},
                        {}, [], [row], [], None)
             self.assertIn("| 5.00 | 4.00 | 10.000 | 20.000 | 20.000 |", path.read_text())
 
