@@ -153,7 +153,7 @@ fn a_stalled_body_is_cut_at_the_idle_timeout_and_stores_nothing() {
     assert_eq!(reader.request("GET", "/stalled", &[AUTH], b"").status, 404);
     assert_eq!(daemon.metric("cachette_written_bytes_total"), 0.0);
     assert_eq!(daemon.metric("cachette_entries"), 0.0);
-    wait_for_empty(&daemon.data_dir.join("tmp"));
+    wait_for_no_temporaries(&daemon.data_dir.join("objects"));
 }
 
 #[test]
@@ -168,23 +168,29 @@ fn a_client_that_hangs_up_mid_body_stores_nothing() {
     }
     let mut reader = Wire::connect(daemon.addr);
     assert_eq!(reader.request("GET", "/hangup", &[AUTH], b"").status, 404);
-    wait_for_empty(&daemon.data_dir.join("tmp"));
+    wait_for_no_temporaries(&daemon.data_dir.join("objects"));
     assert_eq!(daemon.metric("cachette_entries"), 0.0);
 }
 
-fn wait_for_empty(dir: &Path) {
+fn wait_for_no_temporaries(objects: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let left: Vec<_> = fs::read_dir(dir)
-            .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
-            .unwrap_or_default();
+        let left: Vec<_> = fs::read_dir(objects)
+            .expect("objects directory")
+            .flatten()
+            .filter_map(|shard| fs::read_dir(shard.path()).ok())
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".tmp-"))
+            .collect();
         if left.is_empty() {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "temporary files left in {}: {left:?}",
-            dir.display()
+            "temporary files left under {}: {left:?}",
+            objects.display()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
