@@ -1,0 +1,62 @@
+plugins {
+    id 'java'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.13.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.13.4'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// Pseudo-random bytes from a fixed seed: deterministic, so the cache key is stable, and
+// incompressible, so the packed cache entry is as large as the output.
+abstract class RandomBytes extends DefaultTask {
+    @Input
+    abstract Property<Integer> getKibibytes()
+
+    @OutputFile
+    abstract RegularFileProperty getTarget()
+
+    @TaskAction
+    void generate() {
+        def random = new Random(42)
+        def chunk = new byte[1024]
+        target.get().asFile.withOutputStream { out ->
+            kibibytes.get().times {
+                random.nextBytes(chunk)
+                out.write(chunk)
+            }
+        }
+    }
+}
+
+// Small, cacheable, custom task.
+@CacheableTask
+abstract class GenerateReport extends RandomBytes {
+}
+
+// Cacheable, with an output sized by -PblobMiB; only runs when asked for.
+@CacheableTask
+abstract class GenerateBlob extends RandomBytes {
+}
+
+tasks.register('generateReport', GenerateReport) {
+    kibibytes = 64
+    target = layout.buildDirectory.file('reports/random.bin')
+}
+
+tasks.register('generateBlob', GenerateBlob) {
+    kibibytes = providers.gradleProperty('blobMiB').map { it.toInteger() * 1024 }.orElse(1)
+    target = layout.buildDirectory.file('blob/random.bin')
+}

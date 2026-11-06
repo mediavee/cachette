@@ -1,0 +1,18 @@
+// Points any Gradle build at cachette without touching the project: used by gradle-external.sh.
+// Runs after the settings are evaluated, so it replaces a remote cache the project declares.
+gradle.settingsEvaluated { settings ->
+    settings.buildCache {
+        local {
+            enabled = false
+        }
+        remote(HttpBuildCache) {
+            url = System.getenv('CACHETTE_URL') + '/'
+            allowInsecureProtocol = true
+            push = Boolean.parseBoolean(System.getenv('CACHETTE_PUSH') ?: 'true')
+            credentials {
+                username = 'gradle'
+                password = System.getenv('CACHETTE_TOKEN')
+            }
+        }
+    }
+}

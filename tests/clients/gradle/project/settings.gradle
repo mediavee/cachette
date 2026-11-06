@@ -1,0 +1,19 @@
+rootProject.name = 'cachette-demo'
+
+// The remote cache is configured from properties so one project serves every scenario. The local
+// cache is off: a FROM-CACHE line can only come from cachette.
+buildCache {
+    local {
+        enabled = false
+    }
+    remote(HttpBuildCache) {
+        url = providers.gradleProperty('cachetteUrl').get() + '/'
+        allowInsecureProtocol = true
+        push = providers.gradleProperty('cachettePush').map { it.toBoolean() }.getOrElse(true)
+        useExpectContinue = providers.gradleProperty('cachetteExpectContinue').map { it.toBoolean() }.getOrElse(false)
+        credentials {
+            username = 'gradle'
+            password = System.getenv('CACHETTE_TOKEN')
+        }
+    }
+}
