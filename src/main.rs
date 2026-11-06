@@ -8,11 +8,12 @@ mod server;
 mod store;
 
 use std::io::{self, Write};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -86,12 +87,40 @@ async fn run(config: Config) -> anyhow::Result<()> {
         "listening"
     );
 
+    // Stamp when the signal lands: after `serve` returns, an elapsed time at or past
+    // the shutdown timeout means the deadline, not a drain, ended it.
+    let shutdown_at = Arc::new(Mutex::new(None));
+    let stamped = {
+        let shutdown_at = Arc::clone(&shutdown_at);
+        async move {
+            shutdown.await;
+            *shutdown_at.lock().expect("shutdown stamp poisoned") = Some(Instant::now());
+        }
+    };
     server
-        .serve(server::app(&config, store.clone(), metrics), shutdown)
+        .serve(server::app(&config, store.clone(), metrics), stamped)
         .await;
-    store.close().await.context("cannot flush the store")?;
+    if deadline_missed(
+        *shutdown_at.lock().expect("shutdown stamp poisoned"),
+        config.shutdown_timeout,
+    ) {
+        // D32: a missed shutdown deadline forbids `clean = true`. The state written at
+        // open already says not clean; skipping `close` is what keeps it that way.
+        warn!(
+            timeout = ?config.shutdown_timeout,
+            "shutdown deadline missed; leaving the store not clean"
+        );
+    } else {
+        store.close().await.context("cannot flush the store")?;
+    }
     info!("stopped");
     Ok(())
+}
+
+/// Whether the shutdown signal fired at least `timeout` ago, i.e. `serve` returned
+/// because its deadline elapsed rather than because the connections drained.
+fn deadline_missed(signal_at: Option<Instant>, timeout: Duration) -> bool {
+    signal_at.is_some_and(|at| at.elapsed() >= timeout)
 }
 
 /// Sends every log line through a queue and a writer thread, so logging never blocks a request.
@@ -109,4 +138,19 @@ fn init_tracing(format: LogFormat) -> anyhow::Result<WorkerGuard> {
     }
     .map_err(|e| anyhow::anyhow!("cannot initialise logging: {e}"))?;
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_rule() {
+        assert!(!deadline_missed(None, Duration::from_secs(1)));
+        assert!(!deadline_missed(
+            Some(Instant::now()),
+            Duration::from_secs(60)
+        ));
+        assert!(deadline_missed(Some(Instant::now()), Duration::ZERO));
+    }
 }

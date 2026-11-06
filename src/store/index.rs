@@ -75,6 +75,8 @@ pub(super) struct Entry {
 pub(super) struct Hit {
     pub(super) size: u64,
     pub(super) modified: SystemTime,
+    /// The version hit; a recency touch carries it and is dropped if it changed.
+    pub(super) generation: u64,
     pub(super) persist_recency: Option<SystemTime>,
 }
 
@@ -122,11 +124,14 @@ impl Index {
         u64::try_from(self.map.len()).unwrap_or(u64::MAX)
     }
 
-    /// Every byte the D12 bound counts.
+    /// `vivant` in D12: committed plus reserved bytes.
+    pub(super) fn live(&self) -> u64 {
+        self.size.saturating_add(self.reserved)
+    }
+
+    /// Every byte the D12 hard bound counts: `vivant` plus bytes being deleted.
     pub(super) fn charged_total(&self) -> u64 {
-        self.size
-            .saturating_add(self.reserved)
-            .saturating_add(self.pending)
+        self.live().saturating_add(self.pending)
     }
 
     pub(super) fn contains(&self, digest: Digest) -> bool {
@@ -180,6 +185,7 @@ impl Index {
         Some(Hit {
             size: entry.size,
             modified: entry.modified,
+            generation: entry.generation,
             persist_recency,
         })
     }
@@ -285,16 +291,32 @@ impl Index {
 
     /// Every entry whose in-memory recency was never persisted, marked persisted. The caller
     /// writes the `mtime`s outside the lock; used at a clean shutdown (D14).
-    pub(super) fn take_late_touches(&mut self) -> Vec<(Digest, SystemTime)> {
+    pub(super) fn take_late_touches(&mut self) -> Vec<(Digest, SystemTime, u64)> {
         let mut late = Vec::new();
         for entry in self.slots.iter_mut().flatten() {
             if entry.last_access > entry.last_persisted {
                 entry.last_persisted = entry.last_access;
                 entry.modified = entry.last_access;
-                late.push((entry.digest, entry.last_access));
+                late.push((entry.digest, entry.last_access, entry.generation));
             }
         }
         late
+    }
+
+    /// Whether a recency touch decided for `generation` at `when` still applies: the
+    /// version is unchanged and no newer touch was persisted since.
+    pub(super) fn touch_applies(&self, digest: Digest, generation: u64, when: SystemTime) -> bool {
+        self.entry(digest)
+            .is_some_and(|entry| entry.generation == generation && entry.last_persisted <= when)
+    }
+
+    /// Removes least-recently-used evictable entries freeing at least `want` charged
+    /// bytes (or every evictable entry). The caller charges them to `pending`.
+    pub(super) fn evict_least_recent(&mut self, want: u64) -> Vec<Entry> {
+        self.eviction_candidates(want)
+            .into_iter()
+            .filter_map(|digest| self.remove(digest))
+            .collect()
     }
 
     fn alloc(&mut self, entry: Entry) -> u32 {
@@ -417,10 +439,10 @@ mod tests {
                 .hit(digest(1), at(600), Duration::from_secs(300))
                 .is_some()
         );
-        assert_eq!(index.take_late_touches(), [(digest(1), at(600))]);
+        assert_eq!(index.take_late_touches(), [(digest(1), at(600), 1)]);
         assert_eq!(
             index.take_late_touches(),
-            Vec::<(Digest, SystemTime)>::new()
+            Vec::<(Digest, SystemTime, u64)>::new()
         );
     }
 }

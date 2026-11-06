@@ -5,14 +5,6 @@
 //! crash purges; `http` records requests, hits, misses, bytes read, dropped PUTs and
 //! authentication failures; `server` renders the scrape, which computes the gauges then.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the store and http lots call the remaining recorders"
-    )
-)]
-
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
