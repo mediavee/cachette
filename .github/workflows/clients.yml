@@ -1,6 +1,6 @@
 name: clients
 
-# The real clients against the real binary: Gradle (the version MCore pins, and the latest 8.x)
+# The real clients against the real binary: Gradle (the version our main project pins, and the latest 8.x)
 # and the pinned sccache release. No private source is built here.
 on:
   push:

@@ -11,7 +11,15 @@ import subprocess
 import sys
 import tempfile
 
-from run import AUTH, command
+from run import AUTH, command, machine_label
+
+
+def remote_path(remote, path):
+    """A path on the remote host: `~/` is its home, any other path passes through."""
+    path = str(path)
+    if not path.startswith("~/"):
+        return path
+    return command("ssh", remote, 'printf %s "$HOME"').strip() + path[1:]
 
 
 def require_quiet(max_load):
@@ -70,20 +78,21 @@ def coordinate(args):
         print("Client preflight passed: load low, native oha 1.14.0")
         return
     head = command("git", "-C", str(Path(__file__).parent), "rev-parse", "HEAD")
-    root = args.remote_root
+    root = remote_path(args.remote, args.remote_root)
     remote_head = command("ssh", args.remote, shlex.join(["git", "-C", root, "rev-parse", "HEAD"]))
     if head != remote_head:
         raise RuntimeError(f"Client/server source mismatch: {head} != {remote_head}")
     address = command("ssh", args.remote, "tailscale ip -4").splitlines()[0]
     def ping():
         return ping_evidence(command("tailscale", "ping", "--c", "3", "--until-direct=false", address))
-    context = dict(host=platform.node(), platform=platform.platform(), nproc=os.cpu_count(),
+    context = dict(host=machine_label(), platform=platform.platform(), nproc=os.cpu_count(),
                    uptime=command("uptime"), load=os.getloadavg(), oha=command(str(args.oha), "--version"),
                    tailscale_version=command("tailscale", "version"), ping=ping(), server_address=address)
     remote = ["sudo", "timeout", "3600", "python3", "-B", root + "/bench/run.py",
               "--tailscale-worker", "--servers", *args.servers, "--seconds", str(args.seconds),
-              "--max-load", str(args.max_load), "--cap-mib", str(args.cap_mib),
-              "--work-dir", str(args.work_dir)]
+              "--max-load", str(args.max_load), "--cap-mib", str(args.cap_mib)]
+    if args.work_dir is not None:
+        remote += ["--work-dir", remote_path(args.remote, args.work_dir)]
     process = subprocess.Popen(["ssh", args.remote, shlex.join(remote)], stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, text=True)
     received = False

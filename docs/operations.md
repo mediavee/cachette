@@ -84,7 +84,7 @@ its file's modification time at most that often. After a restart the order is re
 times.
 
 Leave room on the disk beyond `max_size`: the ceiling counts objects, not directory blocks or other
-files. In the [final benchmark](../bench/results/2026-11-06T204503Z-dev2.md) (lines 451 to 688), a
+files. In the [final benchmark](../bench/results/2026-11-06T204503Z-linux-x86_64-16t.md) (lines 451 to 688), a
 4 GiB ceiling peaked at 3.84 GiB (`purge-on-crash`) and 3.93 GiB (`fsync`) of allocated blocks,
 directories and temporary files included.
 `min_free_disk` is the second guard.
@@ -100,7 +100,7 @@ of evicted files. bazel-remote behaves the same way.
 
 Evidence: the store test `ceiling_holds_with_pending_deletions_held` in
 [`src/store/mod.rs`](../src/store/mod.rs), and the eviction-pressure traces of the
-[final benchmark](../bench/results/2026-11-06T204503Z-dev2.md).
+[final benchmark](../bench/results/2026-11-06T204503Z-linux-x86_64-16t.md).
 
 ## Backup
 
@@ -180,7 +180,7 @@ and a failed `syncfs` all count as unclean. A first start on an empty directory 
 purge.
 
 The price is a cold cache after any of those. The gain is that a torn file is never served, and no
-`fsync` is paid per object. In the [final benchmark](../bench/results/2026-11-06T204503Z-dev2.md),
+`fsync` is paid per object. In the [final benchmark](../bench/results/2026-11-06T204503Z-linux-x86_64-16t.md),
 4 KiB PUTs at one client ran at 29 823 requests/s in this mode and 169 in `fsync` mode (mean of two
 runs, lines 83 to 178).
 

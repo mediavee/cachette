@@ -1,23 +1,24 @@
 # Reproducible HTTP cache benchmark
 
 `run.py` is the single entry point. It uses Python's standard library, Docker on
-Linux x86_64 for servers and the local client, and native oha on the Mac mini
-for the Tailscale client. No Python packages are needed. No result here establishes
-that cachette meets D30: its real store/HTTP implementation is still unavailable.
+the Linux x86_64 server host for servers and the loopback client, and a native
+oha build on the macOS arm64 client host for the Tailscale client. No Python
+packages are needed. No result here establishes that cachette meets D30: its real
+store/HTTP implementation is still unavailable.
 
-## Loopback replay on dev2
+## Loopback replay on the server host
 
-From the repository root, with Docker and `timeout`, `df`, `findmnt`, `lsblk`,
-`uptime` and `nproc` installed:
+On the server host, from the repository root, with Docker and `timeout`, `df`,
+`findmnt`, `lsblk`, `uptime` and `nproc` installed:
 
 ```sh
-sudo timeout 3600 python3 -B bench/run.py --servers nginx foster bazel --seconds 5 --work-dir /home/debian/cachette-bench
+sudo timeout 3600 python3 -B bench/run.py --servers nginx foster bazel --seconds 5 --work-dir ~/cachette-bench
 ```
 
 After store/http merge, omit `--servers` to include **both** cachette variants:
 
 ```sh
-sudo timeout 3600 python3 -B bench/run.py --seconds 10 --work-dir /home/debian/cachette-bench
+sudo timeout 3600 python3 -B bench/run.py --seconds 10 --work-dir ~/cachette-bench
 ```
 
 All 24 points (GET/PUT × 4 KiB/64 KiB/1 MiB/32 MiB × c1/16/64) run twice
@@ -33,7 +34,8 @@ are recorded overrides. The runner refuses any occupied port 18080–18083, a
 5/15-minute load does not reject a currently quiet host. Let build load settle
 before replaying. Load is not a disk-isolation guarantee.
 
-Use only `~/cachette-bench/` and the `cachette-bench-*` container prefix on dev2.
+Use only `~/cachette-bench/` and the `cachette-bench-*` container prefix on the
+server host.
 Each server runs alone with `--network host`, on 18080 (cachette), 18081 (nginx),
 18082 (fosterstack), or 18083 (bazel-remote). Loopback runs bind only 127.0.0.1.
 Each variant starts from the same freshly emptied `<work-dir>/run-*/data` path
@@ -42,10 +44,11 @@ Containers and data are removed in `finally`, including SIGTERM. Images/build
 cache remain. SIGKILL, host failure or Docker failure can prevent cleanup:
 inspect the run's named resources before removing them; never stop another service.
 
-## Tailscale replay: mini client, dev2 servers
+## Tailscale replay: client host and server host
 
-Build the same pinned oha source natively on the mini. External source goes in
-`/tmp`; dependencies are locked. This is setup, outside all measurement intervals:
+Build the same pinned oha source natively on the client host. External source goes
+in `/tmp`; dependencies are locked. This is setup, outside all measurement
+intervals:
 
 ```sh
 git clone https://github.com/hatoo/oha /tmp/cachette-bench-oha
@@ -54,41 +57,47 @@ timeout 900 cargo build --locked --release --manifest-path /tmp/cachette-bench-o
 ```
 
 The two checkouts must have the same commit. Update the dedicated checkout on
-dev2 to this branch, then run **on the mini**, without sudo:
+the server host to this branch, then run **on the client host**, without sudo:
 
 ```sh
-timeout 3600 python3 -B bench/run.py --remote dev2 --remote-root /home/debian/cachette-bench/repo --oha "$HOME/cachette-bench/oha-target/release/oha" --servers nginx foster bazel --seconds 10 --work-dir /home/debian/cachette-bench
+timeout 3600 python3 -B bench/run.py --remote <server-host> --oha "$HOME/cachette-bench/oha-target/release/oha" --servers nginx foster bazel --seconds 10
 ```
+
+`<server-host>` is an SSH alias for the server host. `--remote-root` defaults to
+`~/cachette-bench/repo` there, and the worker's work directory to `~/cachette-bench`.
+A path starting with `~/` is resolved against the home of the user SSH logs in as.
 
 After store/http merge, omit `--servers` for both cachette durability modes.
 The subset is GET hit and PUT × 4 KiB/1 MiB × c1/16, twice consecutively: 48
 measurements for the three competitors, or 80 including both cachette modes.
 RSS and eviction pressure belong to the full loopback matrix and are not repeated
 over Tailscale. `--preflight-only` with the same remote/client flags checks the
-mini's load and oha without starting remote servers.
+client host's load and oha without starting remote servers.
 
 SSH is the control plane only. Timed HTTP goes directly from native oha on the
-mini to dev2's `tailscale ip -4`, without SSH forwarding. Servers bind **only that
-Tailscale IPv4**, never 0.0.0.0 or the public address. No firewall or tailnet ACL is
-changed. Existing tailnet policy must allow the mini to dev2 TCP 18080–18083;
-otherwise the run fails and no successful result is published. Other tailnet
-members allowed by that policy can reach the disposable listeners during the run.
-nginx/bazel are unauthenticated; all listeners disappear at cleanup.
+client host to the server host's `tailscale ip -4`, without SSH forwarding.
+Servers bind **only that Tailscale IPv4**, never 0.0.0.0 or the public address. No
+firewall or tailnet ACL is changed. Existing tailnet policy must allow the client
+host to the server host on TCP 18080–18083; otherwise the run fails and no
+successful result is published. Other tailnet members allowed by that policy can
+reach the disposable listeners during the run. nginx/bazel are unauthenticated;
+all listeners disappear at cleanup.
 
-The mini refuses load >2 by default, initially and before every measured cell.
-The remote runner applies the dev2 guard before and after builds. Do not raise
-the threshold just to obtain a publishable result from a busy mini. A refusal
-is a missing measurement, not evidence of network speed.
+The client host refuses load >2 by default, initially and before every measured
+cell. The remote runner applies the server host's guard before and after builds.
+Do not raise the threshold just to obtain a publishable result from a busy client
+host. A refusal is a missing measurement, not evidence of network speed.
 
 Reports retain `tailscale ping --c 3 --until-direct=false` before and after each
 cell: RTT samples and the direct endpoint or DERP route, not an inferred path.
 They record host versions, initial uptime, per-cell loads, useful MiB/s, p50/p99,
 errors and whole-host busy CPU percentages. CPU comes from cumulative Linux
 `/proc/stat` counters (idle+iowait counted idle), and macOS `host_statistics`
-CPU ticks. The mini interval brackets oha; dev2's interval brackets the measure request
-and its reply, adding about one control-plane round trip. Body transfer and
-the pre/post ping probes are outside both intervals. These host-wide intervals
-include unrelated workloads and Tailscale and do not attribute CPU to the server alone. A route can change during an HTTP interval.
+CPU ticks. The client host's interval brackets oha; the server host's interval
+brackets the measure request and its reply, adding about one control-plane round
+trip. Body transfer and the pre/post ping probes are outside both intervals. These
+host-wide intervals include unrelated workloads and Tailscale and do not attribute
+CPU to the server alone. A route can change during an HTTP interval.
 
 ## Versions, durability and semantics
 
@@ -96,7 +105,7 @@ include unrelated workloads and Tailscale and do not attribute CPU to the server
 |---|---|---|
 | cachette | `purge-on-crash` | D32, no per-object fsync; purge after unclean run |
 | cachette | `fsync` | D32, file fsync before publication; no directory fsync |
-| nginx | no fsync | Debian DAV and DAV-ext, sendfile, automatic workers |
+| nginx | no fsync | `dav` and `dav-ext` modules, sendfile, automatic workers |
 | fosterstack | file fsync + bbolt | default admission limit of 32 uploads retained |
 | bazel-remote | file fsync | uncompressed CAS; endpoint metrics disabled |
 
@@ -123,7 +132,7 @@ no cachette performance figures are fabricated.
   are explicitly disabled (D30). CAS hash checking and default disk-I/O admission
   remain. UID 0 matches disposable bind-mount permissions on the other servers.
 - nginx packages and image identities/layers for all builds are recorded.
-  A live PROPFIND must return 207. Tags and Debian repositories can move;
+  A live PROPFIND must return 207. Tags and apt repositories can move;
   retain the images to replay the exact binaries.
 
 bazel keys are `/cas/<SHA-256 of body>`. Timed PUT repeatedly uploads one object,
@@ -165,6 +174,8 @@ this scenario does not prove LRU order, quota reservations or durable retention.
 
 One **Markdown file per successful run** contains tables and embedded raw JSON
 (metadata, exact versions, all oha outputs, RSS, disk trace, probes and loads).
+The runner names it `<utc>-<os>-<arch>-<nproc>t.md` and puts the same label in its
+`host` field, so a report says what kind of machine produced it and never its name.
 Failed runs write `failed-<timestamp>.md` outside `results/`, in the working
 directory for diagnosis. They are not committed. Instability, HTTP errors and
 unfavorable successful runs remain; success means completion, not good performance.
@@ -183,33 +194,36 @@ results belong to the clients lot; D30 remains unproven here.
 The historical successful reports retain their original source/configuration
 and measurements, with raw evidence consolidated into each Markdown file:
 
-- [Expanded 4 GiB matrix, 5 s](results/2026-11-06T181342Z-dev2.md):
+- [Expanded 4 GiB matrix, 5 s](results/2026-11-06T181342Z-linux-x86_64-16t.md):
   exit 0 on pushed source `c557b0bb45230633bac544edfd73d2b1951eb00f`;
   144 measurements including 64 KiB, six positive RSS peaks and three pressure
   traces. Ten of 72 pairs exceed ±10% (four nginx, two foster, four bazel): nine
   PUT and one nginx 32 MiB GET/c16. All GET pairs through 1 MiB meet the tolerance
   in this run. No HTTP/transport errors for nginx/bazel; foster returns 429 in
-  PUT/c64. All 1152 pressure PUTs are 2xx. Initial dev2 load was 1.03; load rose
-  during the run and is retained per point (final 26.65). No cause is established
-  for variation; these shared-host results do not justify a stable PUT ranking.
-  The final renderer fixes table formatting without changing raw observations.
+  PUT/c64. All 1152 pressure PUTs are 2xx. Initial server host load was 1.03; load
+  rose during the run and is retained per point (final 26.65). No cause is
+  established for variation; these shared-host results do not justify a stable PUT
+  ranking. The final renderer fixes table formatting without changing raw
+  observations.
 
-  The mini→dev2 timed run was refused: mini load 34.13 exceeded the default 2
-  on 2026-11-06. No network throughput/CPU benchmark result is published. The
-  remote replay command above remains required when both machines are quiet.
-  Functional startup probes did confirm that each competitor binds only dev2's
-  Tailscale IPv4 and serves a 4 KiB GET to the mini (200); bazel's body matched
-  its CAS key. They intentionally stop before timed load and publish no benchmark
-  result. Their diagnostic failure reports remain outside the repository.
-- [4 GiB, three servers, 5 s](results/2026-11-06T174832Z-dev2.md): 108 measurements,
-  all GET repeat pairs within ±10%; 10/54 points unstable, all PUT. No timed HTTP
-  errors for nginx/bazel; foster predominantly 429 at PUT/c64. All 1152 pressure
-  PUTs are 2xx. This predates the 64 KiB point and Tailscale path.
-- [1 GiB, three servers, 5 s](results/2026-11-06T173458Z-dev2.md): 108 measurements,
-  7/54 points unstable. bazel returns predominantly 507 at PUT 32 MiB/c64;
-  those uploads can exceed the cap. This is capacity-constrained evidence.
-- [256 MiB, nginx/foster, 5 s](results/2026-11-06T171913Z-dev2.md): 72 measurements,
-  9/36 points unstable. No cause established.
+  The Tailscale timed run was refused: client host load 34.13 exceeded the default
+  2 on 2026-11-06. No network throughput/CPU benchmark result is published. The
+  remote replay command above remains required when both hosts are quiet.
+  Functional startup probes did confirm that each competitor binds only the server
+  host's Tailscale IPv4 and serves a 4 KiB GET to the client host (200); bazel's
+  body matched its CAS key. They intentionally stop before timed load and publish
+  no benchmark result. Their diagnostic failure reports remain outside the
+  repository.
+- [4 GiB, three servers, 5 s](results/2026-11-06T174832Z-linux-x86_64-16t.md):
+  108 measurements, all GET repeat pairs within ±10%; 10/54 points unstable, all
+  PUT. No timed HTTP errors for nginx/bazel; foster predominantly 429 at PUT/c64.
+  All 1152 pressure PUTs are 2xx. This predates the 64 KiB point and Tailscale path.
+- [1 GiB, three servers, 5 s](results/2026-11-06T173458Z-linux-x86_64-16t.md):
+  108 measurements, 7/54 points unstable. bazel returns predominantly 507 at
+  PUT 32 MiB/c64; those uploads can exceed the cap. This is capacity-constrained
+  evidence.
+- [256 MiB, nginx/foster, 5 s](results/2026-11-06T171913Z-linux-x86_64-16t.md):
+  72 measurements, 9/36 points unstable. No cause established.
 
 ## Runner verification
 
@@ -220,5 +234,6 @@ python3 -B bench/run.py --preflight-only
 
 Boundary tests cover load/ports (including 18083), both cachette modes and size
 boundary, all-process RSS, CAS addresses and unique pressure bodies, goodput/error
-accounting and disappearing files without hiding permission errors. Mutation
-results and runtime commands are recorded in the PR body.
+accounting, disappearing files without hiding permission errors, the report name
+and host field against the machine label, and remote `~/` paths. Mutation results
+and runtime commands are recorded in the PR body.
