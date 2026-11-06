@@ -584,6 +584,13 @@ fn refused_puts_that_send_first_still_get_their_status() {
     );
     assert_eq!(invalid_key.status, 400);
 
+    let reserved = send_first_put(
+        &mut wire,
+        "/healthz",
+        &[("Authorization", "Bearer writesecret")],
+    );
+    assert_eq!(reserved.status, 405);
+
     // The same connection carries on, and nothing was stored.
     let miss = wire.request("GET", &key, &[("Authorization", "Bearer readsecret")], b"");
     assert_eq!(miss.status, 404);
