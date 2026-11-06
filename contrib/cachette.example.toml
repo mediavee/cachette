@@ -1,0 +1,120 @@
+# cachette configuration, as deployed for the Mediavee build cache.
+#
+# Every setting has a line here, with the reason for its value. Lines starting with `# key =` show
+# the built-in default: uncomment one only to change it. An unknown key stops the server at start,
+# so a typo cannot go unnoticed.
+#
+# Precedence, lowest first: built-in default, this file, `CACHETTE_<KEY>` environment variable,
+# command-line flag (`cachette --help` lists them). Sizes read "26GiB", durations "30s" or "5m".
+
+# --- Where it listens ---------------------------------------------------------------------------
+
+# 127.0.0.1:5071 by default, the port the old Develocity Build Cache Node used, so clients keep
+# their URL. The host is reached over Tailscale, which is the access boundary here (no TLS), so the
+# server listens on every address; on a host with a public interface, name the Tailscale address
+# instead. Port 0 picks a free port, which is for tests.
+listen = "0.0.0.0:5071"
+
+# HTTPS needs both, as PEM files; set neither for plain HTTP. Tailscale already encrypts the path,
+# so the deployment runs without. Under systemd, pass the files with LoadCredential (see the unit).
+# tls_cert = "/etc/cachette/tls.pem"
+# tls_key = "/etc/cachette/tls.key"
+
+# --- How much it stores -------------------------------------------------------------------------
+
+# The cache directory. Under the systemd unit it must be the unit's StateDirectory, the only path
+# the sandbox lets the service write. Keep it on a local filesystem (ext4, XFS): the durability mode
+# below assumes the disk honours write barriers.
+data_dir = "/var/lib/cachette"
+
+# Mandatory: there is no unlimited cache. The ceiling covers stored objects, uploads in flight and
+# evicted objects not yet deleted, each rounded up to 4 KiB, so the disk use never goes above it.
+# The VM has about 30 GB: 26 GiB leaves room for the system and for `min_free_disk`. To size it,
+# watch `cachette_oldest_entry_age_seconds`: an oldest entry only hours old means the cache is too
+# small for the builds it serves.
+max_size = "26GiB"
+
+# Largest object accepted. A bigger PUT is not stored but still answers 200, because Gradle turns
+# its remote cache off for the rest of the build on any other status. Never above `max_size`.
+# max_object_size = "512MiB"
+
+# Free space the filesystem must keep: a PUT that would eat into it is dropped. It protects
+# whatever else lives on the disk, and the server's own logs and state file.
+# min_free_disk = "1GiB"
+
+# --- What a crash costs -------------------------------------------------------------------------
+
+# `purge-on-crash` writes no `fsync` per object, which costs 4 to 9 ms a PUT. In exchange, any
+# unclean stop (crash, power cut, SIGKILL, a shutdown past its deadline) makes the next start delete
+# every object, rather than ever serve a torn file. A cold cache is the accepted price. Linux only,
+# and it is the default there. Use `fsync` on a network or restored volume, where the barrier
+# assumptions fail, and on macOS (where it is the default).
+# durability = "purge-on-crash"
+
+# Recency is kept in each file's mtime, written at most this often per object, so that a restart
+# keeps the eviction order without a database write on every hit. Longer means fewer writes and a
+# staler order after a crash.
+# touch_interval = "5m"
+
+# --- Limits on clients --------------------------------------------------------------------------
+
+# A client that opens a connection and sends nothing must not hold it.
+# header_read_timeout = "10s"
+
+# A body that stays silent this long is cut. Idle time, not total time, so slow large uploads pass.
+# body_idle_timeout = "60s"
+
+# Largest request header section; hyper refuses anything under 8KiB.
+# max_header_size = "16KiB"
+
+# How long requests in flight get to finish after SIGTERM. The systemd unit's TimeoutStopSec (2 min)
+# must stay above this plus the final `syncfs`: see the comment there.
+# shutdown_timeout = "30s"
+
+# --- Logs and runtime ---------------------------------------------------------------------------
+
+# `text` reads well in journald; `json` is for a log shipper.
+# log_format = "text"
+
+# `errors` logs failures, refusals and dropped PUTs, which is everything an operator must see.
+# `all` adds a line per hit, 2 to 3 µs and a syscall each: for debugging only.
+# access_log = "errors"
+
+# Async worker threads; the blocking pool is left at tokio's default. The default, one per core, is
+# right unless the VM shares its cores with something else.
+# worker_threads = 4
+
+# --- Who may use it -----------------------------------------------------------------------------
+
+# `read` lets requests without credentials read; it never lets them write. Closed by default, and
+# closed here: every client, CI and developers alike, carries a token.
+# anonymous = "none"
+
+# A token on /metrics. Unset, it is open, which is fine on a tailnet; set it when Prometheus
+# scrapes across a boundary. Prefer CACHETTE_METRICS_TOKEN in the environment file.
+# metrics_token = "..."
+
+# Tokens come last: TOML puts every key after a [[tokens]] header inside that token.
+#
+# Only the CI of `main` writes. Anything that can write can poison what every other build reads, so
+# branch CI and developers get `read`: their PUTs answer 403, loudly, and Gradle warns once.
+# Clients send the secret as the Basic password (Gradle; the user name is ignored), as Basic
+# base64url (Bazel) or as a Bearer token (sccache). Names show in the access log, secrets never do.
+# Make a secret with `openssl rand -hex 32`. CACHETTE_TOKENS="name:access:secret,..." replaces
+# every [[tokens]] below. The systemd unit hands this file to the service as a private copy, so the
+# file itself can stay root-only (0600).
+
+[[tokens]]
+name = "ci-main"
+access = "write"
+secret = "REPLACE-ME-ci-main"
+
+[[tokens]]
+name = "ci-branches"
+access = "read"
+secret = "REPLACE-ME-ci-branches"
+
+[[tokens]]
+name = "developers"
+access = "read"
+secret = "REPLACE-ME-developers"

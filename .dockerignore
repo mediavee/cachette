@@ -1,0 +1,5 @@
+# The image is built from the two release binaries and nothing else: keep the context to them, so
+# target/ and .git never travel to the builder.
+*
+!dist/amd64/cachette
+!dist/arm64/cachette

@@ -1,0 +1,86 @@
+# Hardened unit for the cachette binary installed at /usr/local/bin/cachette.
+#
+#   install -m 0644 contrib/systemd/cachette.service /etc/systemd/system/
+#   install -d /etc/cachette
+#   install -m 0600 contrib/cachette.example.toml /etc/cachette/cachette.toml   # then edit it
+#   systemctl enable --now cachette
+#
+# Needs systemd 247 or later (LoadCredential and the %d specifier).
+
+[Unit]
+Description=cachette remote build cache (Gradle, sccache)
+Documentation=https://github.com/mediavee/cachette
+# When `listen` names one interface's address (a Tailscale one, say), also order this unit after
+# the service that brings that interface up.
+After=network.target
+
+[Service]
+# `exec` reports a missing or non-executable binary as a failed start, not as a success.
+Type=exec
+ExecStart=/usr/local/bin/cachette --config %d/cachette.toml
+
+# The file may hold token secrets, so it stays root-only (0600): systemd reads it as root and hands
+# the service a private copy, in a directory only its dynamic user can open.
+LoadCredential=cachette.toml:/etc/cachette/cachette.toml
+# Settings and secrets that belong in the environment rather than the file, such as
+# CACHETTE_TOKENS="ci-main:write:...,dev:read:..." (it replaces the file's [[tokens]]) or
+# CACHETTE_METRICS_TOKEN. Optional; keep it 0600.
+EnvironmentFile=-/etc/cachette/cachette.env
+# For TLS, hand the service its certificate the same way and point tls_cert and tls_key at
+# %d/tls.pem and %d/tls.key:
+#LoadCredential=tls.pem:/etc/cachette/tls.pem
+#LoadCredential=tls.key:/etc/cachette/tls.key
+
+# SIGTERM is the clean stop: the server refuses new connections, lets requests in flight finish for
+# `shutdown_timeout` (30 s by default), waits for its writers, runs `syncfs` on the cache and only
+# then records the shutdown as clean. Under the default `purge-on-crash` durability, a stop that
+# systemd ends with SIGKILL leaves the store marked unclean, and the next start deletes every
+# object. So the timeout must leave room for `shutdown_timeout` plus a `syncfs` of a full disk,
+# and must be raised along with `shutdown_timeout`.
+KillSignal=SIGTERM
+TimeoutStopSec=2min
+# A clean stop exits 0 and stays stopped; a crash or a start-up refusal is retried.
+Restart=on-failure
+RestartSec=2s
+
+# One socket per connection and one descriptor per open object being served.
+LimitNOFILE=65536
+
+# The cache lives in /var/lib/cachette (`data_dir`), the only path the service can write.
+DynamicUser=yes
+StateDirectory=cachette
+StateDirectoryMode=0700
+UMask=0077
+
+# Sandbox. A network server needs a few syscalls and two address families, not the rest of the system.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Logs go to stderr, which journald hands over as an inherited descriptor: no AF_UNIX needed.
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+# @system-service holds what a daemon doing file and socket I/O uses, including `syncfs` (@sync)
+# and `flock` (@file-system).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
