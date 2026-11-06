@@ -270,17 +270,20 @@ pub(crate) fn app(config: &Config, store: Store, metrics: Metrics) -> Router {
         metrics: metrics.clone(),
         metrics_token: config.metrics_token,
     };
-    let reserved = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/metrics", get(scrape))
-        .with_state(operations);
     let keys = http::router(http::State {
         store,
         metrics,
         tokens: config.tokens.clone().into(),
         anonymous: config.anonymous,
         access_log: config.access_log,
+        max_object_size: config.max_object_size,
     });
+    // Other methods on the reserved paths go to the key router, which refuses them the way it
+    // refuses any write (draining a body sent without `Expect`), instead of axum's bare 405.
+    let reserved = Router::new()
+        .route("/healthz", get(healthz).fallback_service(keys.clone()))
+        .route("/metrics", get(scrape).fallback_service(keys.clone()))
+        .with_state(operations);
     reserved
         .merge(keys)
         .layer(RequestBodyTimeoutLayer::new(config.body_idle_timeout))

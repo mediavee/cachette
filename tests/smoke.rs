@@ -83,14 +83,13 @@ fn metrics_token_guards_the_scrape() {
 }
 
 #[test]
-fn reserved_paths_are_not_keys_and_keys_hit_the_stub() {
+fn reserved_paths_are_not_keys() {
     let daemon = Daemon::start(&[]);
-    assert_eq!(daemon.request("PUT", "/healthz", &[]).status, 405);
-    assert_eq!(daemon.request("PUT", "/metrics", &[]).status, 405);
-    for method in ["GET", "HEAD", "PUT", "PROPFIND", "DELETE"] {
-        let response = daemon.request(method, "/some/key", &[("Content-Length", "0")]);
-        assert_eq!(response.status, 501, "{method}");
-    }
+    let writer = [("Authorization", "Bearer secret")];
+    assert_eq!(daemon.request("PUT", "/healthz", &writer).status, 405);
+    assert_eq!(daemon.request("PUT", "/metrics", &writer).status, 405);
+    // A write without credentials is refused for its credentials first, like on any key.
+    assert_eq!(daemon.request("PUT", "/healthz", &[]).status, 401);
 }
 
 #[test]
