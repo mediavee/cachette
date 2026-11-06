@@ -2296,6 +2296,27 @@ mod tests {
         );
     }
 
+    // D13, D32: after an unclean `purge-on-crash` run nothing is left: no object, and no
+    // temporary an interrupted upload left in a shard.
+    #[tokio::test]
+    async fn crash_purge_start_leaves_no_object_and_no_temporary() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = options(MIB);
+        opts.durability = Durability::PurgeOnCrash;
+        let store = Store::open(dir.path(), opts.clone()).await.unwrap();
+        assert_eq!(put(&store, &key("k"), b"data").await, Outcome::Stored);
+        let shard = object_path(dir.path(), &key("k").digest())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::write(shard.join(".tmp-3"), b"interrupted upload").unwrap();
+        drop(store); // No close(): an unclean purge-on-crash run.
+        let reopened = open_retried(dir.path(), opts).await;
+        ready(&reopened).await;
+        assert_eq!(reopened.stats().entries, 0);
+        assert_eq!(walk(&dir.path().join("objects")), Vec::<PathBuf>::new());
+    }
+
     #[tokio::test]
     async fn survives_a_restart_and_refuses_a_second_opener() {
         let dir = TempDir::new().unwrap();
