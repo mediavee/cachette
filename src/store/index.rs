@@ -69,12 +69,10 @@ pub(super) struct Entry {
     older: u32,
 }
 
-/// What a hit decided: the meta to answer with, and whether the `mtime` must be rewritten
-/// outside the lock.
+/// What a hit decided: whether the `mtime` must be rewritten outside the lock, and for
+/// which version.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Hit {
-    pub(super) size: u64,
-    pub(super) modified: SystemTime,
     /// The version hit; a recency touch carries it and is dropped if it changed.
     pub(super) generation: u64,
     pub(super) persist_recency: Option<SystemTime>,
@@ -134,10 +132,6 @@ impl Index {
         self.live().saturating_add(self.pending)
     }
 
-    pub(super) fn contains(&self, digest: Digest) -> bool {
-        self.map.contains_key(&digest)
-    }
-
     pub(super) fn generation(&self, digest: Digest) -> Option<u64> {
         self.entry(digest).map(|entry| entry.generation)
     }
@@ -183,8 +177,6 @@ impl Index {
             None
         };
         Some(Hit {
-            size: entry.size,
-            modified: entry.modified,
             generation: entry.generation,
             persist_recency,
         })
@@ -419,6 +411,19 @@ mod tests {
         assert_eq!(removed.generation, second);
         assert_eq!((index.entries(), index.size), (0, 0));
         assert!(index.remove(digest(1)).is_none());
+    }
+
+    // A touch decided for a replaced version never applies to the new one, even with a
+    // later date: a version committed from a file written before the hit is newer.
+    #[test]
+    fn touch_of_a_replaced_version_does_not_apply() {
+        let mut index = Index::with_capacity(1);
+        let old = index.commit(digest(1), 10, 4096, at(100));
+        let hit = index.hit(digest(1), at(300), Duration::ZERO).expect("hit");
+        assert_eq!((hit.generation, hit.persist_recency), (old, Some(at(300))));
+        let new = index.commit(digest(1), 10, 4096, at(200));
+        assert!(index.touch_applies(digest(1), new, at(300)));
+        assert!(!index.touch_applies(digest(1), old, at(300)));
     }
 
     #[test]

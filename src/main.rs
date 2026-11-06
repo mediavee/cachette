@@ -87,8 +87,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
         "listening"
     );
 
-    // Stamp when the signal lands: after `serve` returns, an elapsed time at or past
-    // the shutdown timeout means the deadline, not a drain, ended it.
+    // Stamp when the signal lands: the shutdown timeout bounds the drain and the store's
+    // close together, measured from there.
     let shutdown_at = Arc::new(Mutex::new(None));
     let stamped = {
         let shutdown_at = Arc::clone(&shutdown_at);
@@ -100,27 +100,33 @@ async fn run(config: Config) -> anyhow::Result<()> {
     server
         .serve(server::app(&config, store.clone(), metrics), stamped)
         .await;
-    if deadline_missed(
+    // D32: a missed shutdown deadline forbids `clean = true`. The state written at open
+    // already says not clean; skipping or abandoning `close` keeps it that way.
+    let remaining = remaining_before_deadline(
         *shutdown_at.lock().expect("shutdown stamp poisoned"),
         config.shutdown_timeout,
-    ) {
-        // D32: a missed shutdown deadline forbids `clean = true`. The state written at
-        // open already says not clean; skipping `close` is what keeps it that way.
+    );
+    if remaining.is_zero() {
         warn!(
             timeout = ?config.shutdown_timeout,
-            "shutdown deadline missed; leaving the store not clean"
+            "shutdown deadline missed while draining; leaving the store not clean"
         );
+    } else if let Ok(closed) = tokio::time::timeout(remaining, store.close()).await {
+        closed.context("cannot flush the store")?;
     } else {
-        store.close().await.context("cannot flush the store")?;
+        warn!(
+            timeout = ?config.shutdown_timeout,
+            "shutdown deadline missed while closing the store; leaving it not clean"
+        );
     }
     info!("stopped");
     Ok(())
 }
 
-/// Whether the shutdown signal fired at least `timeout` ago, i.e. `serve` returned
-/// because its deadline elapsed rather than because the connections drained.
-fn deadline_missed(signal_at: Option<Instant>, timeout: Duration) -> bool {
-    signal_at.is_some_and(|at| at.elapsed() >= timeout)
+/// What is left of the shutdown `timeout` since the signal: zero once `serve` returned at
+/// its deadline rather than because the connections drained.
+fn remaining_before_deadline(signal_at: Option<Instant>, timeout: Duration) -> Duration {
+    signal_at.map_or(timeout, |at| timeout.saturating_sub(at.elapsed()))
 }
 
 /// Sends every log line through a queue and a writer thread, so logging never blocks a request.
@@ -146,11 +152,11 @@ mod tests {
 
     #[test]
     fn deadline_rule() {
-        assert!(!deadline_missed(None, Duration::from_secs(1)));
-        assert!(!deadline_missed(
-            Some(Instant::now()),
-            Duration::from_secs(60)
-        ));
-        assert!(deadline_missed(Some(Instant::now()), Duration::ZERO));
+        let timeout = Duration::from_secs(60);
+        assert_eq!(remaining_before_deadline(None, timeout), timeout);
+        let fresh = remaining_before_deadline(Some(Instant::now()), timeout);
+        assert!(fresh > Duration::from_secs(59) && fresh <= timeout);
+        let long_ago = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+        assert!(remaining_before_deadline(Some(long_ago), Duration::from_secs(1)).is_zero());
     }
 }
