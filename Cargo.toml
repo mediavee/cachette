@@ -1,0 +1,109 @@
+[package]
+name = "cachette"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Remote build cache server for Gradle and sccache"
+license = "MIT"
+repository = "https://github.com/mediavee/cachette"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"          # each unsafe op needs its own unsafe block
+missing_debug_implementations = "warn"   # every public type implements Debug
+missing_docs = "warn"                    # [lib] document every public item
+unreachable_pub = "warn"                 # pub items that aren't actually exported
+rust_2018_idioms = { level = "warn", priority = -1 } # 2018-edition idioms, e.g. Formatter<'_>
+
+[lints.clippy]
+# Groups first, at lower priority so the individual settings below win.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Panics: return errors, and give every intentional panic a reason.
+unwrap_used = "warn"                     # use ?, or expect("why this cannot fail")
+expect_used = "allow"                    # expect with a reason is the sanctioned form
+panic_in_result_fn = "warn"              # a fn returning Result shouldn't also panic
+missing_panics_doc = "warn"              # [lib] document reachable panics under # Panics
+missing_errors_doc = "warn"              # [lib] document failures under # Errors
+missing_assert_message = "warn"          # assert! says what went wrong (quiet inside #[test])
+
+# Suppressions must explain themselves and expire when no longer needed.
+allow_attributes = "warn"                # prefer #[expect] over #[allow] (needs rust-version 1.81+)
+allow_attributes_without_reason = "warn" # every suppression says why (needs rust-version 1.81+)
+
+# Unsafe must be justified.
+undocumented_unsafe_blocks = "warn"      # // SAFETY: comment on every unsafe block
+multiple_unsafe_ops_per_block = "warn"   # one unsafe operation per block
+
+# API shape.
+fn_params_excessive_bools = "warn"       # bool parameters: use an enum or two methods
+struct_excessive_bools = "warn"          # many bool fields: use an enum or bitflags
+clone_on_ref_ptr = "warn"                # write Rc::clone(&x) so cheap clones are visible
+redundant_clone = "warn"                 # a clone whose original is never used again
+rc_buffer = "warn"                       # Rc<String> / Rc<Vec<T>>: use Rc<str> / Rc<[T]>
+
+# Evolution.
+exhaustive_enums = "warn"                # [lib] exported enums are #[non_exhaustive] (quiet in binaries)
+
+# Idioms.
+string_add = "warn"                      # build strings with format! or push_str, not +
+wildcard_imports = "warn"                # no glob imports (use super::* in tests is allowed)
+
+# Output and debugging leftovers.
+dbg_macro = "warn"
+todo = "warn"
+print_stdout = "warn"                    # [lib] libraries log, they don't print
+print_stderr = "warn"                    # [lib] libraries log, they don't print
+
+# Casts that silently lose information.
+as_conversions = "warn"                  # prefer From / TryFrom
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+
+# Pedantic lints that are mostly noise in practice, or that the skill disagrees with.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+module_inception = "allow"               # a leaf module named after its main item is fine
+enum_glob_use = "allow"                  # use Enum::* inside a function that matches on it
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+blake3 = "1.8.7"
+bytes = "1.12.1"
+bytesize = "2.7.0"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+futures-util = { version = "0.3.34", default-features = false }
+humantime = "2.4.0"
+hyper = { version = "1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server", "http1", "service", "server-graceful"] }
+metrics = { version = "0.24.6", default-features = false }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+percent-encoding = "2.3.2"
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "fs", "signal", "time", "io-util"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7.20", default-features = false, features = ["io"] }
+toml = "1.2.1"
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
+tower-http = { version = "0.7.1", default-features = false, features = ["timeout"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+proptest = "1.12.0"
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+tempfile = "3.27.0"
+
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
