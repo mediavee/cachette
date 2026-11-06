@@ -388,7 +388,7 @@ def render(path, metadata, versions, probes, rows, pressure, failure):
         rss = f"{row['peak_rss_kib'] / 1024:.2f}" if row["peak_rss_kib"] else "—"
         lines.append(f"| {row['server']} | {row.get('durability', DURABILITY.get(row['server'], 'unspecified'))} | {row['method']} | {row['size']} | {row['concurrency']} | {row['repeat']} | {rps:.2f} | {good_rps * row['size'] / 1048576:.2f} | {latency['p50'] * 1000:.3f} | {latency['p99'] * 1000:.3f} | {errors:.3f} | {rss} |")
     lines += ["", "## Repeatability", "", "Second throughput relative to first; |delta| <= 10% passes.", "",
-              "| Server | Durability | Method | Bytes | c | Delta % | <=10% |", "|---|---|---|---:|---:|---:|---:|---|"]
+              "| Server | Durability | Method | Bytes | c | Delta % | <=10% |", "|---|---|---|---:|---:|---:|---|"]
     for first, second in zip(rows[::2], rows[1::2]):
         r1, _ = statistics(first["oha"])
         r2, _ = statistics(second["oha"])
@@ -406,11 +406,13 @@ def render(path, metadata, versions, probes, rows, pressure, failure):
         lines += ["", "## Tailscale and host CPU", "",
                   "CPU is whole-host busy percentage over each request interval, including other workloads and Tailscale; not process attribution.",
                   "RTT and direct/DERP evidence are the tailscale ping output before and after each cell in raw evidence.", "",
-                  "| Server | Durability | Method | Bytes | c | Run | Client CPU % | Server CPU % | Client load 1/5/15 |",
-                  "|---|---|---|---:|---:|---:|---:|---:|---|"]
+                  "| Server | Durability | Method | Bytes | c | Run | Client CPU % | Server CPU % | RTT min/max ms (before/after) | Route (before/after) | Client load 1/5/15 |",
+                  "|---|---|---|---:|---:|---:|---:|---:|---|---|---|"]
         for row in rows:
             client = row["client"]
-            lines.append(f"| {row['server']} | {row['durability']} | {row['method']} | {row['size']} | {row['concurrency']} | {row['repeat']} | {client['cpu_busy']:.2f} | {row['server_cpu_busy']:.2f} | {client['load']} |")
+            samples = client["ping_before"]["rtt_ms"] + client["ping_after"]["rtt_ms"]
+            states = sorted(set(client["ping_before"]["states"] + client["ping_after"]["states"]))
+            lines.append(f"| {row['server']} | {row['durability']} | {row['method']} | {row['size']} | {row['concurrency']} | {row['repeat']} | {client['cpu_busy']:.2f} | {row['server_cpu_busy']:.2f} | {min(samples):.2f}/{max(samples):.2f} | {', '.join(states)} | {client['load']} |")
     evidence = dict(metadata=metadata, versions=versions, probes=probes, rows=rows, pressure=pressure, failure=failure)
     lines += ["", "<details><summary>Raw evidence</summary>", "", "```json",
               json.dumps(evidence, indent=2), "```", "", "</details>", ""]

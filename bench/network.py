@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import subprocess
 import sys
@@ -41,6 +42,15 @@ def cpu_busy(before, after):
     return 100 * (total - idle) / total
 
 
+def ping_evidence(output):
+    rtts = [float(value) for value in re.findall(r"in ([0-9.]+)\s*ms", output)]
+    routes = re.findall(r" via (.+?) in ", output)
+    if not rtts or len(routes) != len(rtts):
+        raise RuntimeError("Tailscale ping has no complete RTT/route samples")
+    return dict(raw=output, rtt_ms=rtts, routes=routes,
+                states=["DERP" if "DERP" in route else "direct" for route in routes])
+
+
 def rpc(**message):
     print(json.dumps(message), file=sys.__stdout__, flush=True)
     response = sys.stdin.readline()
@@ -66,7 +76,7 @@ def coordinate(args):
         raise RuntimeError(f"Client/server source mismatch: {head} != {remote_head}")
     address = command("ssh", args.remote, "tailscale ip -4").splitlines()[0]
     def ping():
-        return command("tailscale", "ping", "--c", "3", "--until-direct=false", address)
+        return ping_evidence(command("tailscale", "ping", "--c", "3", "--until-direct=false", address))
     context = dict(host=platform.node(), platform=platform.platform(), nproc=os.cpu_count(),
                    uptime=command("uptime"), load=os.getloadavg(), oha=command(str(args.oha), "--version"),
                    tailscale_version=command("tailscale", "version"), ping=ping(), server_address=address)

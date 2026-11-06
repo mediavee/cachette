@@ -1,6 +1,9 @@
 from pathlib import Path
 import socket
 import hashlib
+import io
+import json
+import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import subprocess
@@ -150,6 +153,69 @@ class MatrixTests(unittest.TestCase):
     def test_cpu_percentage_uses_counter_deltas(self):
         from network import cpu_busy
         self.assertEqual(cpu_busy((100, 50), (300, 100)), 75)
+
+
+class NetworkTests(unittest.TestCase):
+    def test_ping_retains_rtt_and_route_changes(self):
+        from network import ping_evidence
+        evidence = ping_evidence("pong from dev2 via DERP(fra) in 28ms\npong from dev2 via [::1]:41641 in 11ms")
+        self.assertEqual(evidence["rtt_ms"], [28, 11])
+        self.assertEqual(evidence["states"], ["DERP", "direct"])
+        with self.assertRaises(RuntimeError):
+            ping_evidence("no pong")
+
+    def test_remote_cli_refuses_busy_client_before_oha_or_ssh(self):
+        result = subprocess.run([sys.executable, "-B", "-c",
+            f'import os,runpy,sys; sys.path.insert(0,{str(RUN.parent)!r}); os.getloadavg=lambda:(3,0,0); sys.argv=[{str(RUN)!r},"--remote","dev2","--oha","/missing","--preflight-only"]; runpy.run_path({str(RUN)!r},run_name="__main__")'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Refusing client: 1-minute load", result.stderr)
+
+    def test_control_protocol_runs_client_and_writes_one_report(self):
+        import network
+        worker = """
+import json,sys
+
+def exchange(message):
+ print(json.dumps(message),flush=True)
+ result=json.loads(sys.stdin.readline())
+ assert 'error' not in result,result
+ return result
+exchange(dict(action='context'))
+result=exchange(dict(action='measure',url='http://100.64.0.1:18081/fixture',method='PUT',body='YWJj',concurrency=16,seconds=1))
+exchange(dict(action='report',name='fixture.md',text=json.dumps(result)))
+"""
+        popen = subprocess.Popen
+        calls = []
+        def tool(*args):
+            calls.append(args)
+            if args[0] == "/fixture/oha":
+                if "--version" in args:
+                    return "oha 1.14.0"
+                self.assertEqual(args[-1], "http://100.64.0.1:18081/fixture")
+                self.assertEqual(Path(args[args.index("-D") + 1]).read_bytes(), b"abc")
+                self.assertIn("Authorization: " + run.AUTH, args)
+                return '{"fixture": true}'
+            if args[0] == "git" or "git -C" in args[-1]:
+                return "same-head"
+            if args[0] == "ssh":
+                return "100.64.0.1"
+            if args[0] == "tailscale" and args[1] == "ping":
+                return "pong from dev2 via 127.0.0.1:41641 in 11ms"
+            return "fixture"
+        with tempfile.TemporaryDirectory() as directory:
+            args = types.SimpleNamespace(max_load=2, oha=Path("/fixture/oha"), preflight_only=False,
+                remote="dev2", remote_root="/fixture/repo", servers=["nginx"], seconds=1,
+                cap_mib=4096, work_dir=Path(directory), results=Path(directory))
+            with patch.object(network, "command", side_effect=tool), patch("os.getloadavg", return_value=(0,0,0)), \
+                 patch.object(network, "cpu_ticks", side_effect=[(100,50),(300,100)]), \
+                 patch.object(network.subprocess, "Popen", side_effect=lambda *a, **kw: popen([sys.executable,"-B","-c",worker], **kw)), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                network.coordinate(args)
+            self.assertEqual([p.name for p in Path(directory).iterdir()], ["fixture.md"])
+            result = json.loads((Path(directory) / "fixture.md").read_text())
+            self.assertEqual(result["oha"], {"fixture": True})
+            self.assertEqual(result["cpu_busy"], 75)
+            self.assertEqual(result["ping_after"]["rtt_ms"], [11])
 
 
 class ReportTests(unittest.TestCase):
