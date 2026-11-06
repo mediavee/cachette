@@ -10,35 +10,69 @@
 //!   evicted but not yet deleted never exceed `max_size`. Sizes are charged rounded up to 4 KiB.
 //!   [`Store::admit`] evicts least recently used entries until the reservation fits, and refuses
 //!   with [`DropReason::NoSpace`] when even evicting everything evictable would not make it fit or
-//!   when the disk would drop below `min_free_disk`.
+//!   when the disk would drop below `min_free_disk`. [`Store::open`] does the same at start-up:
+//!   when the scanned objects already exceed `max_size` (a smaller `max_size` than last run), it
+//!   evicts the least recently used entries until they fit, before [`Store::is_ready`] turns
+//!   `true`. The naive implementation does not, and serves a store above its limit.
 //! * **Pinned keys (D12).** A key is not evictable from its reservation until it is stored or the
 //!   reservation is dropped. An eviction decided before an object was stored never deletes it: a
 //!   deletion still pending carries a generation, so it cannot remove a newer version.
-//! * **Atomic writes (D13).** The body goes to `tmp/<unique>`, is flushed (and `fsync`ed when
-//!   `fsync` is set), then renamed to the object path, then the directory is `fsync`ed. The object
-//!   is visible only after the rename. Concurrent writes of one key all succeed, the last rename
-//!   wins and the key is counted once. A reader that already opened the file keeps the old
-//!   version. The data directory is `flock`ed at [`Store::open`] before `tmp/` is emptied.
+//! * **Atomic writes (D13).** The body goes to `tmp/<unique>`, then is renamed to the object path.
+//!   The object is visible only after the rename, and `201` follows it. Concurrent writes of one
+//!   key all succeed, the last rename wins and the key is counted once. A reader that already
+//!   opened the file keeps the old version. The data directory is `flock`ed at [`Store::open`]
+//!   before `tmp/` is emptied.
+//! * **Durability (D32).** A `state` file in the data directory records the durability mode of
+//!   the run and `clean = true|false`. [`Store::open`], under the `flock` and before any mutation
+//!   or served read, loads the previous state, then writes the new one with `clean = false` and
+//!   syncs it (file, then directory). If the previous state is absent, unreadable, or
+//!   `clean = false` after a `purge-on-crash` run, it purges **all** objects before serving
+//!   anything; an interrupted purge leaves `clean = false` and starts over at the next start. It
+//!   counts the purge with [`Metrics::crash_purge`] and logs a `warn`. A run in `fsync` mode that
+//!   stops badly does not purge, unless the run before it was `purge-on-crash` and not clean.
+//!   [`Store::close`] closes admissions, waits for every writer and background task (a missed
+//!   shutdown deadline forbids `clean = true`), runs `syncfs` on the objects' file system and
+//!   **checks that it succeeded**, then writes `clean = true` and syncs it. A `syncfs` or I/O error
+//!   leaves `clean = false`. With [`Durability::Fsync`] a write does `flush`, then `sync_all` of
+//!   the file before the rename, and never syncs the directory: a recovered name always denotes a
+//!   complete version, and the last PUT may vanish. With [`Durability::PurgeOnCrash`] a write
+//!   syncs nothing. This is Linux-only (macOS has no `syncfs`, which the configuration refuses).
+//!   The boot identifier is not consulted. Crash tests cover each persistent transition: before
+//!   and after `state` is written, mid-purge, during shutdown, and a failing `syncfs`.
 //! * **Index and readiness (D14).** The index is rebuilt from `objects/` at start-up, the recency
 //!   from `mtime`. Until it is built [`Store::is_ready`] is `false`, [`Store::admit`] answers
 //!   [`DropReason::NotReady`] without waiting, and reads are served straight from disk. Recency
-//!   is written back to `mtime` at most once per `touch_interval`, and for every late entry in
-//!   [`Store::close`].
-//! * **Reads never fail on eviction (D14).** [`Store::read`] retries once when the file vanishes
-//!   between the lookup and the open, then answers `None`.
-//! * **No waiting between headers and body (D7).** [`Store::admit`] is synchronous, takes no
-//!   lock a writer can hold across I/O, and does no I/O. Nothing in [`Reservation::write`]
-//!   waits for the index, an eviction or a key lock before it starts consuming the body.
-//! * **Concurrency (D15).** One `std::sync::Mutex` over the index, never held across an `.await`
-//!   or an I/O call. File I/O runs on tokio's blocking pool and reads stream in bounded chunks.
-//! * **Metrics.** The store records `written_bytes` when an object becomes visible, and
-//!   `eviction` for each eviction. `http` records everything else.
+//!   is decided under the lock and written back to `mtime` outside it, at most once per
+//!   `touch_interval`, and for every late entry in [`Store::close`].
+//! * **Reads (D14, D33).** [`Store::read`] retries once when the file vanishes between the lookup
+//!   and the open, then answers `None`. [`Object::into_stream`] has two paths: an object of
+//!   64 KiB or less is read by one blocking task into a buffer of its size and leaves as a single
+//!   `Bytes`; a larger one streams in blocks of 64 KiB, bounded by its known length (no read past
+//!   the end). `ReaderStream::new` (4 KiB blocks) is forbidden: it divides throughput by 6 to 10.
+//! * **Writes (D34).** The admitted body goes through a bounded channel (depth 4) to one blocking
+//!   task that owns the temporary file, writes through a 64 KiB `BufWriter`, then validates
+//!   (`rename`, and `sync_all` before it in `fsync` mode). No `tokio::fs` write per frame.
+//!   Consuming the body starts without waiting (D7).
+//! * **No waiting between headers and body (D7).** [`Store::admit`] is synchronous and does no
+//!   I/O. Nothing it takes can be held by a writer across I/O, and nothing in
+//!   [`Reservation::write`] waits for the index, an eviction or a key lock before it starts
+//!   consuming the body.
+//! * **Index and locking (D15, D35).** One `std::sync::Mutex` over the index, with O(1) critical
+//!   sections: never held across an `.await`, and **never across any I/O, [`Store::open`]
+//!   included**. Competing validations of one key are serialised by a separate lock, which only
+//!   validations take. Eviction deletions and `mtime` touches are decided under the lock and
+//!   executed outside it. File I/O runs on tokio's blocking pool.
+//! * **Metrics.** The store records `written_bytes` when an object becomes visible, `eviction` for
+//!   each eviction and `crash_purge`, through the [`Metrics`] in its [`Options`]. `http` records
+//!   everything else.
 //!
 //! # The naive implementation
 //!
 //! Files live at `objects/<2 hex>/<64 hex>` ([`Key::relative_path`]). There is no index and no
-//! eviction: a full store refuses writes with `no_space`. Totals are exact because commits are
-//! serialised under one lock. Recency, `touch_interval` and `min_free_disk` are not used.
+//! eviction: a full store refuses writes with `no_space`. Totals are exact because validations
+//! are serialised by their own lock, apart from the accounting lock. Writes use `tokio::fs`, not
+//! the D34 task. Recency, `touch_interval`, `min_free_disk` and the crash recovery are not
+//! implemented: a [`Durability::PurgeOnCrash`] store simply does not sync.
 
 #![expect(
     dead_code,
@@ -57,11 +91,13 @@ use futures_util::{Stream, StreamExt};
 use thiserror::Error;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
+use tokio::runtime::Handle;
 use tokio_util::io::ReaderStream;
 use tracing::{error, warn};
 
+use crate::config::Durability;
 use crate::key::Key;
-use crate::metrics;
+use crate::metrics::Metrics;
 
 /// Granularity of the space accounting (D12).
 const BLOCK: u64 = 4096;
@@ -78,11 +114,13 @@ pub(crate) struct Options {
     /// Free space the disk must keep after a reservation, in bytes.
     #[expect(dead_code, reason = "read by the disk store, not by the naive one")]
     pub(crate) min_free_disk: u64,
-    /// Whether to `fsync` files and directories before answering a write.
-    pub(crate) fsync: bool,
+    /// What a write spends to survive a crash.
+    pub(crate) durability: Durability,
     /// Minimum delay between two persisted recency updates of one entry.
     #[expect(dead_code, reason = "read by the disk store, not by the naive one")]
     pub(crate) touch_interval: Duration,
+    /// Where the store records what it writes, evicts and purges.
+    pub(crate) metrics: Metrics,
 }
 
 /// A store failure the caller can only report: the disk or the data directory misbehaved.
@@ -211,7 +249,11 @@ struct Accounts {
 struct Inner {
     root: PathBuf,
     options: Options,
+    /// O(1) accounting; held for a few instructions, never across I/O (D35).
     accounts: Mutex<Accounts>,
+    /// Serialises validations so a replaced version is counted exactly once. Only
+    /// [`commit_blocking`] takes it, so a validation stuck in I/O cannot stall an admission.
+    validation: Mutex<()>,
     ready: AtomicBool,
     next_tmp: AtomicU64,
     /// Held for the life of the process: the `flock` of D13.
@@ -396,6 +438,7 @@ fn open_blocking(root: PathBuf, options: Options) -> Result<Inner, Error> {
         root,
         options,
         accounts: Mutex::new(accounts),
+        validation: Mutex::new(()),
         ready: AtomicBool::new(false),
         next_tmp: AtomicU64::new(0),
         _lock: lock,
@@ -505,7 +548,7 @@ impl Reservation {
             .await
             .map_err(Error::io("write", &path))
             .map_err(Failure::Io)?;
-        if self.inner.options.fsync {
+        if self.inner.options.durability == Durability::Fsync {
             file.sync_all()
                 .await
                 .map_err(Error::io("fsync", &path))
@@ -522,82 +565,76 @@ impl Reservation {
         let destination = self.destination.clone();
         let inner = Arc::clone(&self.inner);
         let charged = self.charged;
-        let (renamed, result) =
-            blocking(move || commit_blocking(&inner, &temporary, &destination, charged)).await;
-        if renamed {
-            self.temporary = None;
-            self.settled = true;
-            if result.is_ok() {
-                metrics::written_bytes(self.size);
-            }
-        }
-        result
+        blocking(move || commit_blocking(&inner, &temporary, &destination, charged)).await?;
+        self.temporary = None;
+        self.settled = true;
+        self.inner.options.metrics.written_bytes(self.size);
+        Ok(())
     }
 }
 
-/// Moves the temporary file into place and updates the totals. Returns whether the object is now
-/// visible, and the outcome of the whole commit.
+/// Moves the temporary file into place and updates the totals.
 ///
-/// The accounts lock is held from the lookup of the replaced version to the end of the rename so
-/// that totals stay exact when two writers race on one key. The lock lives in a blocking task and
-/// is never held across an `.await`; the disk store replaces this with its index.
+/// The reservation stays charged until the rename is done. Validations take `validation` for the
+/// lookup of the replaced version and the rename, so totals stay exact when two writers race on
+/// one key; `accounts` is taken afterwards, only for the O(1) update, so an admission never waits
+/// for the disk. The disk store replaces this with its index.
 fn commit_blocking(
     inner: &Inner,
     temporary: &Path,
     destination: &Path,
     charged: u64,
-) -> (bool, Result<(), Error>) {
-    let Some(parent) = destination.parent() else {
-        return (
-            false,
-            Err(Error::io("commit", destination)(
-                io::ErrorKind::InvalidInput.into(),
-            )),
-        );
+) -> Result<(), Error> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Error::io("commit", destination)(io::ErrorKind::InvalidInput.into()))?;
+    std::fs::create_dir_all(parent).map_err(Error::io("create", parent))?;
+    let _validation = inner.validation.lock().expect("validation lock poisoned");
+    let replaced = match std::fs::metadata(destination) {
+        Ok(meta) => Some(charge(meta.len())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(Error::io("stat", destination)(e)),
     };
-    if let Err(e) = std::fs::create_dir_all(parent) {
-        return (false, Err(Error::io("create", parent)(e)));
+    std::fs::rename(temporary, destination).map_err(Error::io("rename", destination))?;
+    let mut accounts = inner.accounts.lock().expect("accounts lock poisoned");
+    accounts.reserved = accounts.reserved.saturating_sub(charged);
+    accounts.size = accounts
+        .size
+        .saturating_sub(replaced.unwrap_or(0))
+        .saturating_add(charged);
+    if replaced.is_none() {
+        accounts.entries += 1;
     }
-    {
-        let mut accounts = inner.accounts.lock().expect("accounts lock poisoned");
-        let replaced = match std::fs::metadata(destination) {
-            Ok(meta) => Some(charge(meta.len())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return (false, Err(Error::io("stat", destination)(e))),
-        };
-        if let Err(e) = std::fs::rename(temporary, destination) {
-            return (false, Err(Error::io("rename", destination)(e)));
-        }
-        accounts.reserved = accounts.reserved.saturating_sub(charged);
-        accounts.size = accounts
-            .size
-            .saturating_sub(replaced.unwrap_or(0))
-            .saturating_add(charged);
-        if replaced.is_none() {
-            accounts.entries += 1;
-        }
-    }
-    if inner.options.fsync {
-        let synced = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
-        return (true, synced.map_err(Error::io("fsync", parent)));
-    }
-    (true, Ok(()))
+    Ok(())
 }
 
 impl Drop for Reservation {
+    /// Cancels an unsettled reservation. The temporary file is removed on the blocking pool, and
+    /// the room stays charged until it is gone, so the bound of D12 holds meanwhile.
     fn drop(&mut self) {
         if self.settled {
             return;
         }
-        if let Some(path) = self.temporary.take() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => warn!(path = %path.display(), error = %e, "cannot remove temporary file"),
+        let inner = Arc::clone(&self.inner);
+        let temporary = self.temporary.take();
+        let charged = self.charged;
+        let cancel = move || {
+            if let Some(path) = temporary {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "cannot remove temporary file");
+                    }
+                }
             }
+            let mut accounts = inner.accounts.lock().expect("accounts lock poisoned");
+            accounts.reserved = accounts.reserved.saturating_sub(charged);
+        };
+        match Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(cancel)),
+            Err(_) => cancel(),
         }
-        let mut accounts = self.inner.accounts.lock().expect("accounts lock poisoned");
-        accounts.reserved = accounts.reserved.saturating_sub(self.charged);
     }
 }
 
@@ -618,8 +655,9 @@ mod tests {
             max_size,
             max_object_size: max_size,
             min_free_disk: 0,
-            fsync: true,
+            durability: Durability::Fsync,
             touch_interval: Duration::from_secs(300),
+            metrics: Metrics::detached(),
         }
     }
 
@@ -660,6 +698,17 @@ mod tests {
 
     fn temporaries(dir: &TempDir) -> usize {
         std::fs::read_dir(dir.path().join("tmp")).unwrap().count()
+    }
+
+    /// Waits for `condition`, which a cancelled write reaches on the blocking pool.
+    async fn eventually(what: &str, condition: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{what} did not happen within 2s");
     }
 
     #[tokio::test]
@@ -743,7 +792,10 @@ mod tests {
             Admission::Dropped(DropReason::NoSpace)
         ));
         drop((first, second));
-        assert!(matches!(store.admit(&key("k3"), 1), Admission::Reserved(_)));
+        eventually("the rooms given back", || {
+            matches!(store.admit(&key("k3"), 1), Admission::Reserved(_))
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -760,12 +812,63 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(200), write)
             .await
             .unwrap_err();
-        assert_eq!(temporaries(&dir), 0, "temporary file left behind");
-        assert!(
-            matches!(store.admit(&k, 4), Admission::Reserved(_)),
-            "room not given back"
-        );
+        eventually("temporary file removal", || temporaries(&dir) == 0).await;
+        eventually("room given back", || {
+            matches!(store.admit(&k, 4), Admission::Reserved(_))
+        })
+        .await;
         assert!(store.read(&k).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_write_keeps_its_room_until_cleanup_is_done() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(BLOCK)).await.unwrap();
+        let Admission::Reserved(reservation) = store.admit(&key("k"), 4) else {
+            panic!("not admitted")
+        };
+        // No runtime context: cleanup runs inline, so the room is back as soon as drop returns.
+        let outside = std::thread::spawn(move || drop(reservation));
+        outside.join().unwrap();
+        assert!(matches!(store.admit(&key("k2"), 4), Admission::Reserved(_)));
+    }
+
+    #[tokio::test]
+    async fn admission_does_not_wait_for_a_validation_stuck_in_io() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let inner = Arc::clone(&store.inner);
+        // Stands for a rename that takes a long time: it owns the validation lock.
+        let stuck = std::thread::spawn(move || {
+            let _validation = inner.validation.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let writer = {
+            let (store, k) = (store.clone(), key("slow"));
+            tokio::spawn(async move { put(&store, &k, b"data").await })
+        };
+        let shard = dir.path().join("objects");
+        eventually("the write to reach its validation", || {
+            std::fs::read_dir(&shard).unwrap().count() > 0
+        })
+        .await;
+
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let prober = store.clone();
+        std::thread::spawn(move || {
+            let admitted = matches!(prober.admit(&key("other"), 4), Admission::Reserved(_));
+            answer_tx.send(admitted).unwrap();
+        });
+        let admitted = answer_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        stuck.join().unwrap();
+        assert_eq!(admitted, Ok(true), "admission waited for the validation");
+        assert_eq!(writer.await.unwrap(), Outcome::Stored);
     }
 
     #[tokio::test]
@@ -783,7 +886,7 @@ mod tests {
         let failing = stream::iter([Ok(Bytes::from_static(b"12345")), Err("reset")]);
         assert_eq!(reservation.write(failing).await, Outcome::Aborted);
         assert!(store.read(&k).await.unwrap().is_none());
-        assert_eq!(temporaries(&dir), 0);
+        eventually("temporary files removed", || temporaries(&dir) == 0).await;
         assert_eq!(store.stats().entries, 0);
     }
 

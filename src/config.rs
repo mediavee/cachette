@@ -38,13 +38,14 @@ pub(crate) enum ConfigError {
         /// The underlying error.
         source: std::io::Error,
     },
-    /// The configuration file is not valid TOML, or has an unknown or mistyped key.
-    #[error("invalid config file {}: {source}", path.display())]
+    /// The configuration file is not valid TOML, or has an unknown or mistyped key. The message
+    /// carries no excerpt of the file, which may hold secrets.
+    #[error("invalid config file {}: {message}", path.display())]
     Parse {
         /// The file.
         path: PathBuf,
-        /// The underlying error, which names the key.
-        source: toml::de::Error,
+        /// The parser's message, which names the key, and the line it was found on.
+        message: String,
     },
     /// A mandatory key is not set anywhere.
     #[error("`{key}` is required: set it in the config file, as {env} or as {flag}")]
@@ -112,7 +113,7 @@ impl FromStr for Access {
         match text {
             "read" => Ok(Self::Read),
             "write" => Ok(Self::Write),
-            other => Err(format!("access must be `read` or `write`, not `{other}`")),
+            _ => Err("access must be `read` or `write`".to_owned()),
         }
     }
 }
@@ -132,7 +133,8 @@ pub(crate) struct Token {
 impl FromStr for Token {
     type Err = String;
 
-    /// Parses `NAME:ACCESS:SECRET`; the secret may contain `:`.
+    /// Parses `NAME:ACCESS:SECRET`; the secret may contain `:`. An error never repeats any part of
+    /// `text`, since it may be a secret.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let mut parts = text.splitn(3, ':');
         let (Some(name), Some(access), Some(secret)) = (parts.next(), parts.next(), parts.next())
@@ -167,6 +169,44 @@ pub(crate) enum LogFormat {
     Text,
     /// One JSON object per line.
     Json,
+}
+
+/// How much the store spends to survive a crash or a power cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Durability {
+    /// No `fsync` per object. After any unclean shutdown the store purges itself at start-up
+    /// instead of serving a torn file. Needs `syncfs`, so Linux only.
+    PurgeOnCrash,
+    /// `sync_all` each object before it becomes visible. A crash loses at worst recent entries.
+    Fsync,
+}
+
+/// Whether the platform has `syncfs`, which `purge-on-crash` relies on to shut down cleanly.
+const HAS_SYNCFS: bool = cfg!(target_os = "linux");
+
+impl Default for Durability {
+    /// `purge-on-crash` where it is possible, `fsync` elsewhere.
+    fn default() -> Self {
+        if HAS_SYNCFS {
+            Self::PurgeOnCrash
+        } else {
+            Self::Fsync
+        }
+    }
+}
+
+/// Which requests the access log records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AccessLog {
+    /// Errors, authentication refusals and dropped PUTs only.
+    #[default]
+    Errors,
+    /// Every request.
+    All,
+    /// No access log; errors still reach the main log.
+    Off,
 }
 
 /// Certificate chain and private key, both PEM files.
@@ -277,9 +317,10 @@ pub(crate) struct Settings {
     /// Free disk space to keep [default: 1GiB].
     #[arg(long, env = "CACHETTE_MIN_FREE_DISK", value_name = "SIZE")]
     min_free_disk: Option<Size>,
-    /// `fsync` files and directories before answering a PUT [default: true].
-    #[arg(long, env = "CACHETTE_FSYNC", value_name = "BOOL")]
-    fsync: Option<bool>,
+    /// Crash behaviour: purge after an unclean shutdown instead of syncing each object (Linux
+    /// only), or sync each object [default: purge-on-crash on Linux, fsync elsewhere].
+    #[arg(long, env = "CACHETTE_DURABILITY", value_enum, value_name = "MODE")]
+    durability: Option<Durability>,
     /// Minimum delay between two persisted recency updates of an entry [default: 5m].
     #[arg(long, env = "CACHETTE_TOUCH_INTERVAL", value_name = "DURATION")]
     touch_interval: Option<Dur>,
@@ -316,6 +357,12 @@ pub(crate) struct Settings {
     /// Log format on stderr [default: text].
     #[arg(long, env = "CACHETTE_LOG_FORMAT", value_enum, value_name = "FORMAT")]
     log_format: Option<LogFormat>,
+    /// Which requests the access log records [default: errors].
+    #[arg(long, env = "CACHETTE_ACCESS_LOG", value_enum, value_name = "MODE")]
+    access_log: Option<AccessLog>,
+    /// Runtime worker threads [default: the available parallelism].
+    #[arg(long, env = "CACHETTE_WORKER_THREADS", value_name = "N")]
+    worker_threads: Option<usize>,
 }
 
 fn from_string_option<'de, D: Deserializer<'de>>(
@@ -335,7 +382,7 @@ impl Settings {
             max_size: self.max_size.or(lower.max_size),
             max_object_size: self.max_object_size.or(lower.max_object_size),
             min_free_disk: self.min_free_disk.or(lower.min_free_disk),
-            fsync: self.fsync.or(lower.fsync),
+            durability: self.durability.or(lower.durability),
             touch_interval: self.touch_interval.or(lower.touch_interval),
             header_read_timeout: self.header_read_timeout.or(lower.header_read_timeout),
             body_idle_timeout: self.body_idle_timeout.or(lower.body_idle_timeout),
@@ -346,6 +393,8 @@ impl Settings {
             tls_cert: self.tls_cert.or(lower.tls_cert),
             tls_key: self.tls_key.or(lower.tls_key),
             log_format: self.log_format.or(lower.log_format),
+            access_log: self.access_log.or(lower.access_log),
+            worker_threads: self.worker_threads.or(lower.worker_threads),
         }
     }
 }
@@ -359,7 +408,7 @@ pub(crate) struct Cli {
     config: Option<PathBuf>,
     /// Token as NAME:ACCESS:SECRET, `ACCESS` being `read` or `write`. Comma-separated in
     /// `CACHETTE_TOKENS`. Replaces the file's `[[tokens]]` when given; prefer the variable, since
-    /// flags show in the process list.
+    /// flags show in the process list. Kept as text until validation so that no error repeats it.
     #[arg(
         long = "token",
         env = "CACHETTE_TOKENS",
@@ -367,7 +416,7 @@ pub(crate) struct Cli {
         value_delimiter = ',',
         hide_env_values = true
     )]
-    tokens: Vec<Token>,
+    tokens: Vec<String>,
     #[command(flatten)]
     settings: Settings,
 }
@@ -380,7 +429,7 @@ pub(crate) struct Config {
     pub(crate) max_size: u64,
     pub(crate) max_object_size: u64,
     pub(crate) min_free_disk: u64,
-    pub(crate) fsync: bool,
+    pub(crate) durability: Durability,
     pub(crate) touch_interval: Duration,
     pub(crate) header_read_timeout: Duration,
     pub(crate) body_idle_timeout: Duration,
@@ -391,6 +440,8 @@ pub(crate) struct Config {
     pub(crate) metrics_token: Option<Secret>,
     pub(crate) tls: Option<Tls>,
     pub(crate) log_format: LogFormat,
+    pub(crate) access_log: AccessLog,
+    pub(crate) worker_threads: usize,
 }
 
 impl Config {
@@ -407,7 +458,7 @@ impl Config {
         let tokens = if cli.tokens.is_empty() {
             file_tokens
         } else {
-            cli.tokens
+            parse_tokens(&cli.tokens)?
         };
         Self::build(cli.settings.over(file), tokens)
     }
@@ -457,24 +508,11 @@ impl Config {
                 return Err(invalid(key, "must be greater than zero".to_owned()));
             }
         }
+        let worker_threads = worker_threads(settings.worker_threads)?;
+        let durability = durability(settings.durability)?;
         let anonymous = settings.anonymous.unwrap_or_default();
         check_tokens(&tokens, anonymous)?;
-        let tls = match (settings.tls_cert, settings.tls_key) {
-            (Some(cert), Some(key)) => Some(Tls { cert, key }),
-            (None, None) => None,
-            (Some(_), None) => {
-                return Err(invalid(
-                    "tls_key",
-                    "is required when `tls_cert` is set".to_owned(),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(invalid(
-                    "tls_cert",
-                    "is required when `tls_key` is set".to_owned(),
-                ));
-            }
-        };
+        let tls = tls(settings.tls_cert, settings.tls_key)?;
         Ok(Self {
             listen: settings.listen.unwrap_or(DEFAULT_LISTEN),
             data_dir: settings.data_dir.unwrap_or_else(|| PathBuf::from("data")),
@@ -483,7 +521,7 @@ impl Config {
             min_free_disk: settings
                 .min_free_disk
                 .map_or(DEFAULT_MIN_FREE_DISK, |size| size.0),
-            fsync: settings.fsync.unwrap_or(true),
+            durability,
             touch_interval: settings
                 .touch_interval
                 .map_or(DEFAULT_TOUCH_INTERVAL, |d| d.0),
@@ -498,8 +536,62 @@ impl Config {
             metrics_token: settings.metrics_token,
             tls,
             log_format: settings.log_format.unwrap_or_default(),
+            access_log: settings.access_log.unwrap_or_default(),
+            worker_threads,
         })
     }
+}
+
+fn worker_threads(requested: Option<usize>) -> Result<usize, ConfigError> {
+    match requested {
+        Some(0) => Err(invalid("worker_threads", "must be at least 1".to_owned())),
+        Some(threads) => Ok(threads),
+        None => Ok(std::thread::available_parallelism().map_or(1, usize::from)),
+    }
+}
+
+fn durability(requested: Option<Durability>) -> Result<Durability, ConfigError> {
+    let durability = requested.unwrap_or_default();
+    if durability == Durability::PurgeOnCrash && !HAS_SYNCFS {
+        return Err(invalid(
+            "durability",
+            "= \"purge-on-crash\" needs `syncfs`, which this platform lacks: use \"fsync\""
+                .to_owned(),
+        ));
+    }
+    Ok(durability)
+}
+
+fn tls(cert: Option<PathBuf>, key: Option<PathBuf>) -> Result<Option<Tls>, ConfigError> {
+    match (cert, key) {
+        (Some(cert), Some(key)) => Ok(Some(Tls { cert, key })),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(invalid(
+            "tls_key",
+            "is required when `tls_cert` is set".to_owned(),
+        )),
+        (None, Some(_)) => Err(invalid(
+            "tls_cert",
+            "is required when `tls_key` is set".to_owned(),
+        )),
+    }
+}
+
+/// Parses `NAME:ACCESS:SECRET` entries. A failure names the entry's position only: the text may
+/// hold a secret.
+fn parse_tokens(entries: &[String]) -> Result<Vec<Token>, ConfigError> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entry.parse().map_err(|reason| {
+                invalid(
+                    "tokens",
+                    format!("entry {} is malformed: {reason}", index + 1),
+                )
+            })
+        })
+        .collect()
 }
 
 fn invalid(key: &'static str, reason: String) -> ConfigError {
@@ -538,15 +630,39 @@ fn check_tokens(tokens: &[Token], anonymous: Anonymous) -> Result<(), ConfigErro
     Ok(())
 }
 
-fn read_file(path: &Path) -> Result<(Settings, Vec<Token>), ConfigError> {
-    let parse = |source| ConfigError::Parse {
-        path: path.to_path_buf(),
-        source,
+/// Describes a TOML error without any excerpt of `text`, which may hold secrets: the message, the
+/// line and the key (the text before `=`) when the parser knows where, else the key it names.
+fn parse_message(text: &str, source: &toml::de::Error) -> String {
+    let Some(span) = source.span() else {
+        let display = source.to_string();
+        // A mistyped secret (a number, say) is echoed by serde: name the key only.
+        return match ["secret", "metrics_token"]
+            .into_iter()
+            .find(|key| display.contains(&format!("in `{key}`")))
+        {
+            Some(key) => format!("`{key}` must be a non-empty string"),
+            None => display,
+        };
     };
+    let before = &text[..span.start.min(text.len())];
+    let number = before.matches('\n').count() + 1;
+    let line = text[before.rfind('\n').map_or(0, |at| at + 1)..]
+        .lines()
+        .next()
+        .unwrap_or_default();
+    let key = line.split_once('=').map_or("", |(key, _)| key.trim());
+    format!("{} (`{key}`, line {number})", source.message())
+}
+
+fn read_file(path: &Path) -> Result<(Settings, Vec<Token>), ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
         source,
     })?;
+    let parse = |source: toml::de::Error| ConfigError::Parse {
+        path: path.to_path_buf(),
+        message: parse_message(&text, &source),
+    };
     let mut table: toml::Table = text.parse().map_err(parse)?;
     let tokens = match table.remove("tokens") {
         Some(value) => value.try_into().map_err(parse)?,
@@ -590,7 +706,19 @@ mod tests {
         assert_eq!(c.body_idle_timeout, Duration::from_secs(60));
         assert_eq!(c.max_header_size, 16 * 1024);
         assert_eq!(c.touch_interval, Duration::from_secs(300));
-        assert!(c.fsync);
+        assert_eq!(
+            c.durability,
+            if cfg!(target_os = "linux") {
+                Durability::PurgeOnCrash
+            } else {
+                Durability::Fsync
+            }
+        );
+        assert_eq!(c.access_log, AccessLog::Errors);
+        assert_eq!(
+            c.worker_threads,
+            std::thread::available_parallelism().unwrap().get()
+        );
         assert_eq!(c.anonymous, Anonymous::Read);
     }
 
@@ -602,11 +730,10 @@ mod tests {
 
     #[test]
     fn precedence_is_file_then_env_then_cli() {
-        let file =
-            "max_size = \"1GiB\"\nanonymous = \"read\"\nlisten = \"127.0.0.1:1\"\nfsync = false\n";
+        let file = "max_size = \"1GiB\"\nanonymous = \"read\"\nlisten = \"127.0.0.1:1\"\ndurability = \"fsync\"\n";
         let c = config(Some(file), &["--listen", "127.0.0.1:2"]).unwrap();
         assert_eq!(c.listen.port(), 2, "flag must beat file");
-        assert!(!c.fsync, "file must beat default");
+        assert_eq!(c.durability, Durability::Fsync, "file must beat default");
         assert_eq!(c.max_size, 1024 * 1024 * 1024);
     }
 
@@ -685,6 +812,67 @@ mod tests {
             &[],
         ));
         assert!(text.contains("`max_header_size`"), "{text}");
+    }
+
+    #[test]
+    fn malformed_tokens_never_echo_their_text() {
+        for bad in ["ci:invalid:hunter2", "ci:hunter2", "ci:read:", "hunter2"] {
+            let text = message(config(None, &["--max-size", "1GiB", "--token", bad]));
+            assert!(text.contains("`tokens`"), "{text}");
+            assert!(!text.contains("hunter2"), "secret echoed: {text}");
+        }
+    }
+
+    #[test]
+    fn config_file_errors_carry_no_excerpt() {
+        let file = "max_size = \"1GiB\"\n[[tokens]]\nname = \"a\"\naccess = \"read\"\nsecret = 1234hunter\n";
+        let text = message(config(Some(file), &[]));
+        assert!(!text.contains("hunter"), "file excerpt echoed: {text}");
+        assert!(text.contains("line 5"), "{text}");
+        let numeric =
+            "max_size = \"1GiB\"\n[[tokens]]\nname = \"a\"\naccess = \"read\"\nsecret = 987654\n";
+        let text = message(config(Some(numeric), &[]));
+        assert!(
+            text.contains("`secret`") && !text.contains("987654"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn purge_on_crash_is_refused_where_syncfs_is_missing() {
+        let result = config(
+            Some("max_size = \"1GiB\"\nanonymous = \"read\"\ndurability = \"purge-on-crash\""),
+            &[],
+        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(result.unwrap().durability, Durability::PurgeOnCrash);
+        } else {
+            let text = message(result);
+            assert!(
+                text.contains("`durability`") && text.contains("syncfs"),
+                "{text}"
+            );
+        }
+        let explicit = config(
+            Some("max_size = \"1GiB\"\nanonymous = \"read\"\ndurability = \"fsync\""),
+            &[],
+        );
+        assert_eq!(explicit.unwrap().durability, Durability::Fsync);
+    }
+
+    #[test]
+    fn runtime_and_log_options_are_validated() {
+        let text = message(config(
+            Some("max_size = \"1GiB\"\nanonymous = \"read\"\nworker_threads = 0"),
+            &[],
+        ));
+        assert!(text.contains("`worker_threads`"), "{text}");
+        let c = config(
+            Some("max_size = \"1GiB\"\nanonymous = \"read\"\naccess_log = \"all\"\nworker_threads = 3"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!((c.access_log, c.worker_threads), (AccessLog::All, 3));
     }
 
     #[test]

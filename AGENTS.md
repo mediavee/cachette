@@ -14,8 +14,10 @@ cargo test
 cargo deny check
 ```
 
-A fifth job runs `cargo check --locked --all-targets` on the `rust-version` of `Cargo.toml`.
-Raise `rust-version` only when the code needs it, never to follow a dependency bump.
+Two more jobs run on Linux: `cargo check --locked --all-targets` on the `rust-version` of
+`Cargo.toml` (raise it only when the code needs it, never to follow a dependency bump), and
+`cargo test --target x86_64-unknown-linux-musl`, which builds the mimalloc allocator the musl
+binaries ship with and runs the smoke tests against it.
 
 ## Code rules
 
@@ -25,8 +27,12 @@ Raise `rust-version` only when the code needs it, never to follow a dependency b
 - No `unwrap` outside tests. `expect` only with the invariant that makes it safe.
 - Typed errors (`thiserror`) in modules; `anyhow` only in `main.rs`.
 - Fail fast inside; fail gracefully at the client boundary. No swallowed errors.
-- I/O is async; file I/O goes through tokio's blocking pool. Never hold the store's lock across an
-  `.await` or an I/O call.
+- I/O is async; file I/O goes through tokio's blocking pool.
+- **Never `ReaderStream::new` (4 KiB blocks), and never any I/O under the index lock**: not across
+  an `.await`, not in `open`, not in a destructor. Decide under the lock, execute outside it.
+- On a request path, record metrics through the `Metrics` handles, never the `counter!` or
+  `histogram!` macros. Logs go through the non-blocking writer set up in `main.rs`: add no other
+  sink.
 - Never a fully qualified name inline: import it. Comments say why, not what.
 - Every PUT the server does not store still answers 200 and reads the body to its end (D5, D7).
 

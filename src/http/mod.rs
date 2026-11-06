@@ -12,7 +12,8 @@ use std::sync::Arc;
 use axum::Router;
 use axum::http::StatusCode;
 
-use crate::config::{Anonymous, Token};
+use crate::config::{AccessLog, Anonymous, Token};
+use crate::metrics::Metrics;
 use crate::store::Store;
 
 /// What the key handlers need.
@@ -24,6 +25,10 @@ pub(crate) struct State {
     pub(crate) tokens: Arc<[Token]>,
     /// Whether requests without credentials may read.
     pub(crate) anonymous: Anonymous,
+    /// Which requests the access log records. Errors, refusals and dropped PUTs are always logged.
+    pub(crate) access_log: AccessLog,
+    /// Recorders for requests, hits, misses, bytes read, dropped PUTs and refusals.
+    pub(crate) metrics: Metrics,
 }
 
 /// The router for every path that is not reserved.

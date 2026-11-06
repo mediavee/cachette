@@ -44,6 +44,7 @@ fn scrape_exposes_prometheus_text() {
         "cachette_entries 0",
         "cachette_oldest_entry_age_seconds",
         "cachette_hits_total 0",
+        "cachette_crash_purges_total 0",
         "cachette_misses_total 0",
         "cachette_read_bytes_total 0",
         "cachette_written_bytes_total 0",
@@ -110,6 +111,22 @@ fn invalid_configuration_stops_startup_and_names_the_key() {
     let twins = run_to_exit(&[], &[("CACHETTE_TOKENS", "a:read:x,a:write:y")]);
     assert!(!twins.status.success());
     assert!(String::from_utf8_lossy(&twins.stderr).contains("duplicate name `a`"));
+
+    // A malformed token must never be repeated in the error, from the flag or the environment.
+    let flag = run_to_exit(&["--token", "ci:bogus:hunter2"], &[("CACHETTE_TOKENS", "")]);
+    assert!(!flag.status.success());
+    let stderr = String::from_utf8_lossy(&flag.stderr);
+    assert!(
+        stderr.contains("tokens") && !stderr.contains("hunter2"),
+        "{stderr}"
+    );
+    let env = run_to_exit(&[], &[("CACHETTE_TOKENS", "ci:bogus:envsecret")]);
+    assert!(!env.status.success());
+    let stderr = String::from_utf8_lossy(&env.stderr);
+    assert!(
+        stderr.contains("tokens") && !stderr.contains("envsecret"),
+        "{stderr}"
+    );
 
     let garbled = run_to_exit(&["--max-size", "lots"], &[]);
     assert!(!garbled.status.success());
@@ -305,4 +322,37 @@ async fn serves_over_tls_when_configured() {
         common::try_request(daemon.addr, "GET", "/healthz", &[]).map_or(true, |r| r.status != 200),
         "plain HTTP must not be answered on a TLS port"
     );
+}
+
+#[test]
+fn runtime_and_log_settings_are_applied() {
+    let daemon = Daemon::start(&["--worker-threads", "2", "--access-log", "off"]);
+    assert_eq!(daemon.get("/healthz").status, 200);
+    let logs = daemon.logs();
+    assert!(logs.contains("worker_threads=2"), "{logs}");
+    assert!(logs.contains("access_log=Off"), "{logs}");
+    assert!(
+        logs.contains(if cfg!(target_os = "linux") {
+            "durability=PurgeOnCrash"
+        } else {
+            "durability=Fsync"
+        }),
+        "default durability is platform dependent: {logs}"
+    );
+}
+
+#[test]
+fn purge_on_crash_needs_syncfs() {
+    if cfg!(target_os = "linux") {
+        let daemon = Daemon::start(&["--durability", "purge-on-crash"]);
+        assert_eq!(daemon.get("/healthz").status, 200);
+    } else {
+        let refused = run_to_exit(&["--durability", "purge-on-crash"], &[]);
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("durability") && stderr.contains("syncfs"),
+            "{stderr}"
+        );
+    }
 }

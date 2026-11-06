@@ -23,12 +23,11 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
-use metrics_exporter_prometheus::PrometheusHandle;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
@@ -38,7 +37,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, Secret, Tls};
 use crate::http;
-use crate::metrics;
+use crate::metrics::Metrics;
 use crate::store::Store;
 
 /// Pause after a failed `accept`, so a descriptor shortage does not spin the CPU.
@@ -117,6 +116,16 @@ impl Server {
         if self.tls.is_some() { "https" } else { "http" }
     }
 
+    /// Accepts one connection with `TCP_NODELAY` set, for TCP and TLS alike. Without it a small
+    /// response written in two segments waits for the client's delayed ACK, 40 ms or more.
+    async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        let (stream, peer) = self.tcp.accept().await?;
+        if let Err(e) = stream.set_nodelay(true) {
+            debug!(%peer, error = %e, "cannot set TCP_NODELAY");
+        }
+        Ok((stream, peer))
+    }
+
     /// Serves `app` until `shutdown` completes, then stops accepting and lets requests in flight
     /// finish for at most `shutdown_timeout`.
     pub(crate) async fn serve(self, app: Router, shutdown: impl Future<Output = ()>) {
@@ -130,7 +139,7 @@ impl Server {
         loop {
             let (stream, peer) = tokio::select! {
                 () = &mut shutdown => break,
-                accepted = self.tcp.accept() => match accepted {
+                accepted = self.accept() => match accepted {
                     Ok(accepted) => accepted,
                     Err(e) => {
                         warn!(error = %e, "accept failed");
@@ -139,9 +148,6 @@ impl Server {
                     }
                 },
             };
-            if let Err(e) = stream.set_nodelay(true) {
-                debug!(%peer, error = %e, "cannot set TCP_NODELAY");
-            }
             let service = TowerToHyperService::new(service.clone());
             let watcher = graceful.watcher();
             let tls = self.tls.clone();
@@ -253,15 +259,15 @@ pub(crate) fn shutdown_signal() -> Result<impl Future<Output = ()>, Error> {
 #[derive(Debug, Clone)]
 struct Operations {
     store: Store,
-    recorder: PrometheusHandle,
+    metrics: Metrics,
     metrics_token: Option<Secret>,
 }
 
 /// The complete application: `/healthz`, `/metrics`, and every other path to [`http::router`].
-pub(crate) fn app(config: &Config, store: Store, recorder: PrometheusHandle) -> Router {
+pub(crate) fn app(config: &Config, store: Store, metrics: Metrics) -> Router {
     let operations = Operations {
         store: store.clone(),
-        recorder,
+        metrics: metrics.clone(),
         metrics_token: config.metrics_token,
     };
     let reserved = Router::new()
@@ -270,8 +276,10 @@ pub(crate) fn app(config: &Config, store: Store, recorder: PrometheusHandle) -> 
         .with_state(operations);
     let keys = http::router(http::State {
         store,
+        metrics,
         tokens: config.tokens.clone().into(),
         anonymous: config.anonymous,
+        access_log: config.access_log,
     });
     reserved
         .merge(keys)
@@ -293,7 +301,7 @@ async fn scrape(State(operations): State<Operations>, headers: HeaderMap) -> Res
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "));
         if !presented.is_some_and(|secret| expected.matches(secret)) {
-            metrics::auth_failure();
+            operations.metrics.auth_failure();
             return (
                 StatusCode::UNAUTHORIZED,
                 [(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))],
@@ -301,13 +309,46 @@ async fn scrape(State(operations): State<Operations>, headers: HeaderMap) -> Res
                 .into_response();
         }
     }
-    metrics::set_store_gauges(&operations.store.stats());
     (
         [(
             CONTENT_TYPE,
             HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
         )],
-        operations.recorder.render(),
+        operations.metrics.render(&operations.store.stats()),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+    use crate::config::Cli;
+
+    #[tokio::test]
+    async fn accepted_sockets_have_tcp_nodelay() {
+        let cli = Cli::try_parse_from([
+            "cachette",
+            "--listen",
+            "127.0.0.1:0",
+            "--max-size",
+            "1MiB",
+            "--anonymous",
+            "read",
+        ])
+        .unwrap();
+        let server = Server::bind(&Config::load(cli).unwrap()).await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            !client.nodelay().unwrap(),
+            "the test client must start with Nagle on"
+        );
+        let (accepted, _) = server.accept().await.unwrap();
+        assert!(
+            accepted.nodelay().unwrap(),
+            "server-side socket still has Nagle on"
+        );
+    }
 }

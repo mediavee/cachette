@@ -8,21 +8,42 @@ mod server;
 mod store;
 
 use std::io::{self, Write};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
 use tracing::info;
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use config::{Cli, Config, LogFormat};
+use metrics::Metrics;
 use server::Server;
 use store::{Options, Store};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// musl's allocator is 29 to 200 times slower under contention (D39).
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// How often the metrics exporter drains its histogram buffers.
+const METRICS_UPKEEP_PERIOD: Duration = Duration::from_secs(5);
+
+fn main() -> anyhow::Result<()> {
     let config = Config::load(Cli::parse()).context("invalid configuration")?;
-    init_tracing(config.log_format)?;
-    let recorder = metrics::install().context("cannot install the metrics recorder")?;
+    // Held until the end of `main`: dropping it flushes the log lines still queued.
+    let _logs = init_tracing(config.log_format)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.worker_threads)
+        .enable_all()
+        .build()
+        .context("cannot start the async runtime")?
+        .block_on(run(config))
+}
+
+async fn run(config: Config) -> anyhow::Result<()> {
+    let metrics = Metrics::install().context("cannot install the metrics recorder")?;
+    tokio::spawn(metrics.clone().upkeep(METRICS_UPKEEP_PERIOD));
 
     let store = Store::open(
         &config.data_dir,
@@ -30,8 +51,9 @@ async fn main() -> anyhow::Result<()> {
             max_size: config.max_size,
             max_object_size: config.max_object_size,
             min_free_disk: config.min_free_disk,
-            fsync: config.fsync,
+            durability: config.durability,
             touch_interval: config.touch_interval,
+            metrics: metrics.clone(),
         },
     )
     .await
@@ -54,24 +76,37 @@ async fn main() -> anyhow::Result<()> {
         server.scheme()
     )
     .context("cannot announce the address")?;
-    info!(%addr, tls = server.scheme() == "https", data_dir = %config.data_dir.display(), "listening");
+    info!(
+        %addr,
+        tls = server.scheme() == "https",
+        data_dir = %config.data_dir.display(),
+        worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
+        durability = ?config.durability,
+        access_log = ?config.access_log,
+        "listening"
+    );
 
     server
-        .serve(server::app(&config, store.clone(), recorder), shutdown)
+        .serve(server::app(&config, store.clone(), metrics), shutdown)
         .await;
     store.close().await.context("cannot flush the store")?;
     info!("stopped");
     Ok(())
 }
 
-fn init_tracing(format: LogFormat) -> anyhow::Result<()> {
+/// Sends every log line through a queue and a writer thread, so logging never blocks a request.
+/// When the queue is full the new line is dropped, never the request.
+fn init_tracing(format: LogFormat) -> anyhow::Result<WorkerGuard> {
+    let (writer, guard) = tracing_appender::non_blocking(io::stderr());
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(io::stderr);
+        .with_ansi(false)
+        .with_writer(writer);
     match format {
         LogFormat::Text => builder.try_init(),
         LogFormat::Json => builder.json().try_init(),
     }
-    .map_err(|e| anyhow::anyhow!("cannot initialise logging: {e}"))
+    .map_err(|e| anyhow::anyhow!("cannot initialise logging: {e}"))?;
+    Ok(guard)
 }
