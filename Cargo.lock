@@ -293,6 +293,7 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "rcgen",
+ "rustix",
  "rustls-pki-types",
  "serde",
  "tempfile",

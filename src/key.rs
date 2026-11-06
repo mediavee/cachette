@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use percent_encoding::percent_decode_str;
 use thiserror::Error;
@@ -85,16 +85,27 @@ impl Key {
         &self.0
     }
 
-    /// Where the object of this key lives, relative to the data directory:
-    /// `objects/<first 2 hex of the digest>/<64 hex of the digest>`.
-    ///
-    /// Every component is a plain name, so joining it onto the data directory stays below
-    /// `<data dir>/objects` whatever the key was.
-    pub(crate) fn relative_path(&self) -> PathBuf {
-        let digest = blake3::hash(self.0.as_bytes()).to_hex();
-        let digest = digest.as_str();
-        ["objects", &digest[..2], digest].iter().collect()
+    /// The blake3 digest of the normalised key: the store's index key, and the name of the
+    /// object's file through [`object_path`] (D9).
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        *blake3::hash(self.0.as_bytes()).as_bytes()
     }
+}
+
+/// Where the object of `digest` lives under the data directory `root`:
+/// `<root>/objects/<first 2 hex of the digest>/<64 hex of the digest>`.
+///
+/// Every component added to `root` is a plain hex name, so the path stays below
+/// `<root>/objects` whatever the key was. The store builds every object path here.
+pub(crate) fn object_path(root: &Path, digest: &[u8; 32]) -> PathBuf {
+    let hex = blake3::Hash::from_bytes(*digest).to_hex();
+    let hex = hex.as_str();
+    let mut path = PathBuf::with_capacity(root.as_os_str().len() + "/objects/xx/".len() + 64);
+    path.push(root);
+    path.push("objects");
+    path.push(&hex[..2]);
+    path.push(hex);
+    path
 }
 
 /// Validates `decoded` as a key and returns it normalised, borrowed from `decoded` whenever
@@ -157,7 +168,6 @@ impl fmt::Display for Key {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
 
     use proptest::prelude::*;
 
@@ -218,7 +228,10 @@ mod tests {
     }
 
     fn outcome(key: Result<Key, KeyError>) -> Result<(String, PathBuf), KeyError> {
-        key.map(|key| (key.as_str().to_owned(), key.relative_path()))
+        key.map(|key| {
+            let path = object_path(Path::new(""), &key.digest());
+            (key.as_str().to_owned(), path)
+        })
     }
 
     /// Inputs that reach every branch of normalisation: escapes, edge and repeated slashes, dot
@@ -321,11 +334,11 @@ mod tests {
         fn disk_path_stays_under_objects(input in awkward()) {
             let root = Path::new("/data");
             for key in [Key::new(&input), Key::from_uri_path(&input)].into_iter().flatten() {
-                let relative = key.relative_path();
+                let full = object_path(root, &key.digest());
+                let relative = full.strip_prefix(root).unwrap_or(&full).to_path_buf();
                 let parts: Vec<_> = relative.components().collect();
                 prop_assert_eq!(parts.len(), 3, "path {:?}", relative);
                 prop_assert!(parts.iter().all(|c| matches!(c, std::path::Component::Normal(_))));
-                let full = root.join(&relative);
                 prop_assert!(full.starts_with("/data/objects"), "escaped: {:?}", full);
                 let name = full.file_name().and_then(|n| n.to_str()).unwrap_or_default();
                 prop_assert_eq!(name.len(), 64);
