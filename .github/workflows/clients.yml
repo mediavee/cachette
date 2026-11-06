@@ -1,0 +1,76 @@
+name: clients
+
+# The real clients against the real binary: Gradle (the version MCore pins, and the latest 8.x)
+# and the pinned sccache release. No private source is built here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clients-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gradle:
+    name: gradle ${{ matrix.gradle }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # "8" is the latest 8.x release, resolved by the script.
+        gradle: ['9.8.1', '8']
+    env:
+      GRADLE_VERSION: ${{ matrix.gradle }}
+    steps:
+      - uses: actions/checkout@v7
+      # Gradle 8.x runs on Java 24 at most; 21 serves both lines.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Roundtrip, D5 and read-token push
+        run: tests/clients/gradle/run.sh
+      # The check must go red on a cache that holds nothing, or a pass proves nothing.
+      - name: Control, empty server must fail
+        run: |
+          if CLIENTS_SKIP_WARMUP=1 tests/clients/gradle/run.sh roundtrip >control.log 2>&1; then
+            cat control.log; echo "the control passed on an empty cache"; exit 1
+          fi
+          grep -q 'zero FROM-CACHE tasks' control.log || { cat control.log; echo "failed for another reason"; exit 1; }
+          echo "control failed as expected: $(grep 'zero FROM-CACHE' control.log)"
+
+  sccache:
+    name: sccache (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Default and SCCACHE_WEBDAV_DISABLE_CREATE_DIR
+        run: tests/clients/sccache/run.sh
+      - name: Control, empty server must fail
+        run: |
+          if CLIENTS_SKIP_WARMUP=1 tests/clients/sccache/run.sh default >control.log 2>&1; then
+            cat control.log; echo "the control passed on an empty cache"; exit 1
+          fi
+          grep -q 'zero sccache hits' control.log || { cat control.log; echo "failed for another reason"; exit 1; }
+          echo "control failed as expected: $(grep 'zero sccache hits' control.log)"
