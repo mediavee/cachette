@@ -111,8 +111,37 @@ an exact binary replay. A successful PUT is not proof of durable retention;
 cachette may intentionally acknowledge a dropped upload with 200. Only seed
 readback and the separate pressure evidence establish the behavior observed.
 
-No cachette performance result or competitor weakness is asserted from source
-inspection or from the competitors-only run.
+### Recorded dev2 runs
+
+- [Complete competitors run, 5 s per point](results/2026-11-06T171913Z-dev2.md):
+  exit 0 on source head `6cf1af4424601be9cce1eceb130f47e888470dd1`;
+  72 measurements, both pressure traces and four RSS sample sets. Nine of the
+  36 repeated points exceed ±10% (five nginx, four fosterstack). This fails the
+  stability target. Its cause is **not established**: this setup does not isolate
+  client CPU, server scheduling or disk writeback. Longer idle-host runs are
+  needed before claiming a stable ranking; the available measurements do not
+  justify selecting a favorable repetition. The same issues also occur in the
+  longer partial run, so shortening the duration is not established as their cause.
+- [Partial competitors run, 10 s per point](results/2026-11-06T170350Z-dev2.md):
+  exit 1 on source head `463ef608e71dc288f219a4eac0fdcafd77ba9a69`.
+  All 72 throughput rows were collected, but `du` failed on a temporary file
+  removed during fosterstack's pressure scenario. That pressure trace is
+  incomplete. The current block sampler handles this race; this report remains
+  explicitly partial and is not a second successful full run.
+
+In the complete run, fosterstack PUT at concurrency 64 returns predominantly
+429. Its high response rate and low all-response latencies must not be read as
+successful storage performance; use the error and useful MiB/s columns together.
+The default 32-upload admission bound is retained, not tuned for this benchmark.
+
+To replay the complete initial measurement exactly:
+
+```sh
+sudo timeout 3600 python3 -B bench/run.py --servers nginx foster --seconds 5 --work-dir /home/debian/cachette-bench
+```
+
+No cachette comparison follows from these competitors-only results.
+Implementation-level causes remain hypotheses unless tested separately.
 
 ## Runner checks
 
