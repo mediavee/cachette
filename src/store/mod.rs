@@ -59,19 +59,22 @@
 //!   bounded by its known length, each block returning the blocking thread so a slow consumer
 //!   holds none of the shared pool. `ReaderStream::new` (4 KiB blocks) is forbidden: it divides
 //!   throughput by 6 to 10.
-//! * **Writes (D34).** The admitted body goes through a bounded channel (depth 4) to one blocking
-//!   task that owns the temporary file, writes through a 64 KiB `BufWriter`, then validates
-//!   (`rename`, and `sync_all` before it in `fsync` mode). No `tokio::fs` write per frame.
-//!   Consuming the body starts without waiting (D7).
+//! * **Writes (D34, D43).** An object of at most 64 KiB is read into memory, bounded by its
+//!   announced size, then written, synced (D32), renamed and published in one blocking pass: no
+//!   channel, no owner task. A larger body goes through a bounded channel (depth 4) to one
+//!   blocking task that owns the temporary file, writes through a 64 KiB `BufWriter`, then
+//!   validates (`rename`, and `sync_all` before it in `fsync` mode). No `tokio::fs` write per
+//!   frame. Consuming the body starts without waiting (D7).
 //! * **No waiting between headers and body (D7).** [`Store::admit`] is synchronous and does no
 //!   I/O. Nothing it takes can be held by a writer across I/O, and nothing in
 //!   [`Reservation::write`] waits for the index, an eviction or a key lock before it starts
 //!   consuming the body.
 //! * **Index and locking (D15, D35).** One `std::sync::Mutex` over the index, with O(1) critical
 //!   sections: never held across an `.await`, and **never across any I/O, [`Store::open`]
-//!   included**. One global validation lock (not per key) serialises every rename, its index
-//!   publication, and every pending deletion against each other; only writer and deletion tasks
-//!   take it, always before the index lock. Eviction deletions and `mtime` touches are decided
+//!   included**. One validation lock per shard of the digest (256, D43; not per key) serialises
+//!   every rename of that shard, its index publication, and every pending deletion and `mtime`
+//!   touch against each other; only writer and background tasks take it, always before the index
+//!   lock. Eviction deletions and `mtime` touches are decided
 //!   under the index lock and executed outside it. File I/O runs on tokio's blocking pool.
 //! * **Metrics.** The store records `written_bytes` when an object becomes visible, `eviction` for
 //!   each eviction and `crash_purge`, through the [`Metrics`] in its [`Options`]. `http` records
@@ -83,18 +86,20 @@
 //! index ([`index::Index`]) maps that digest to a compact entry and keeps the LRU order in an
 //! intrusive list, behind the one `Mutex` of D15. Admission decides evictions under that lock;
 //! deletions, `mtime` touches, file opens and every other I/O run outside it, on the blocking
-//! pool. Validations and pending deletions are serialised against each other by the separate
-//! validation lock, so a deletion decided against an old generation can never unlink a version
+//! pool. Validations and pending deletions of one shard are serialised against each other by the
+//! separate validation lock of that shard, so a deletion decided against an old generation can never unlink a version
 //! renamed after it.
 
 mod index;
+#[cfg(test)]
+mod put_bench;
 
 use std::fs::File as StdFile;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -123,6 +128,10 @@ const SMALL_OBJECT: u64 = 64 * 1024;
 const WRITE_CHANNEL_DEPTH: usize = 4;
 /// `BufWriter` capacity of a write's blocking task (D34).
 const WRITE_BUFFER: usize = 64 * 1024;
+/// Objects at most this large are written in one blocking pass (D43).
+const SMALL_WRITE: u64 = 64 * 1024;
+/// Validation locks: one per leading digest byte, like the fan-out of `objects/` (D43).
+const VALIDATION_SHARDS: usize = 256;
 /// Chunks a streaming read may have in flight: at most twice [`READ_CHUNK`] bytes per reader.
 const READ_CHANNEL_DEPTH: usize = 2;
 
@@ -335,6 +344,10 @@ struct Hooks {
     close_release: AtomicBool,
     /// `close_blocking` returned.
     close_done: AtomicBool,
+    /// Work handed to the blocking pool or a thread, by any task of the store (D43).
+    dispatches: AtomicU64,
+    /// Body chunks sent to a write's owner task over its channel (D34).
+    channel_sends: AtomicU64,
 }
 
 /// Where a test may pause [`close_blocking`], to cancel the close there.
@@ -378,12 +391,13 @@ struct Inner {
     options: Options,
     /// The index; held for a few O(1) instructions, never across I/O or an `.await` (D35).
     index: Mutex<Index>,
-    /// One global lock, not per key: serialises every validation (rename and index
-    /// publication) against the others, against pending deletions and against recency
-    /// touches, so a deletion decided before a rename cannot unlink the renamed version.
+    /// One lock per shard of the digest, not per key: serialises every validation (rename
+    /// and index publication) of a shard against the others, against pending deletions and
+    /// against recency touches, so a deletion decided before a rename cannot unlink the
+    /// renamed version. Two digests of different shards never wait for each other.
     /// Only background tasks take it, always before `index`, so I/O under it cannot stall
     /// an admission or a read.
-    validation: Mutex<()>,
+    validation: Validation,
     ready: AtomicBool,
     /// Set by [`Store::begin_close`]: admissions refused, refused deletions not retried.
     closed: AtomicBool,
@@ -415,6 +429,34 @@ struct PendingDelete {
     /// Exact object bytes, for the eviction metric.
     size: u64,
     path: PathBuf,
+}
+
+/// A validation lock on its own cache line: neighbouring shards do not share one.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct Shard(Mutex<()>);
+
+/// The validation locks of D12, sharded by the leading byte of the digest (D43).
+#[derive(Debug)]
+struct Validation {
+    shards: Box<[Shard]>,
+}
+
+impl Validation {
+    fn new() -> Self {
+        Self {
+            shards: (0..VALIDATION_SHARDS).map(|_| Shard::default()).collect(),
+        }
+    }
+
+    /// Takes the lock of `digest`'s shard. Callers take it before the index lock.
+    fn lock(&self, digest: Digest) -> MutexGuard<'_, ()> {
+        let shard = self
+            .shards
+            .get(usize::from(digest.0[0]))
+            .expect("one shard per leading digest byte");
+        shard.0.lock().expect("validation lock poisoned")
+    }
 }
 
 /// Handle to the store. Cloning is cheap and every clone shares the same state.
@@ -455,12 +497,31 @@ fn spawn_background(work: impl FnOnce() + Send + 'static) {
 
 /// [`spawn_background`], counted in `background` so [`Store::close`] can wait for it.
 fn spawn_tracked(inner: &Arc<Inner>, work: impl FnOnce() + Send + 'static) {
+    #[cfg(test)]
+    inner.hooks.dispatches.fetch_add(1, Ordering::Relaxed);
     inner.background.fetch_add(1, Ordering::SeqCst);
     let tracked = Arc::clone(inner);
     spawn_background(move || {
         work();
         tracked.background.fetch_sub(1, Ordering::SeqCst);
     });
+}
+
+/// [`spawn_tracked`] for work whose result the caller awaits, with no channel in between.
+async fn blocking_tracked<T: Send + 'static>(
+    inner: &Arc<Inner>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    #[cfg(test)]
+    inner.hooks.dispatches.fetch_add(1, Ordering::Relaxed);
+    inner.background.fetch_add(1, Ordering::SeqCst);
+    let tracked = Arc::clone(inner);
+    blocking(move || {
+        let result = work();
+        tracked.background.fetch_sub(1, Ordering::SeqCst);
+        result
+    })
+    .await
 }
 
 fn digest_of(key: &Key) -> Digest {
@@ -909,7 +970,7 @@ fn touch(inner: &Inner, digest: Digest, path: &Path, when: SystemTime, generatio
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    let _validation = inner.validation.lock().expect("validation lock poisoned");
+    let _validation = inner.validation.lock(digest);
     let applies = {
         let index = inner.index.lock().expect("index lock poisoned");
         index.touch_applies(digest, generation, when)
@@ -945,7 +1006,7 @@ fn delete_pending(inner: &Arc<Inner>, pending: &PendingDelete) {
         std::thread::sleep(Duration::from_millis(1));
     }
     retry_unlink(inner, &pending.path, || {
-        let _validation = inner.validation.lock().expect("validation lock poisoned");
+        let _validation = inner.validation.lock(pending.digest);
         let superseded = {
             let index = inner.index.lock().expect("index lock poisoned");
             matches!(index.generation(pending.digest), Some(g) if g != pending.generation)
@@ -1182,7 +1243,7 @@ fn open_blocking(root: PathBuf, options: Options) -> Result<Inner, Error> {
         root,
         options,
         index: Mutex::new(Index::with_capacity(0)),
-        validation: Mutex::new(()),
+        validation: Validation::new(),
         ready: AtomicBool::new(false),
         closed: AtomicBool::new(false),
         close_decision: Mutex::new(CloseDecision::Pending),
@@ -1525,6 +1586,9 @@ impl Reservation {
     where
         S: Stream<Item = Result<Bytes, E>>,
     {
+        if self.size <= SMALL_WRITE {
+            return self.write_small(body).await;
+        }
         // From here the writer task owns settling the reservation on every path,
         // including this future being dropped (its channel then closes early).
         self.settled = true;
@@ -1560,6 +1624,11 @@ impl Reservation {
                 body_ended = false;
                 break;
             }
+            #[cfg(test)]
+            self.inner
+                .hooks
+                .channel_sends
+                .fetch_add(1, Ordering::Relaxed);
         }
         if body_ended {
             drop(sender.send(WriteMsg::Finish).await);
@@ -1583,6 +1652,33 @@ impl Reservation {
     }
 }
 
+/// The path of a fresh temporary file under `tmp/`.
+fn temporary_path(inner: &Inner) -> PathBuf {
+    let id = inner.next_tmp.fetch_add(1, Ordering::Relaxed);
+    inner
+        .root
+        .join("tmp")
+        .join(format!("{}-{id}", std::process::id()))
+}
+
+/// Ends a write that stored nothing. The temporary's removal (retried until it lands) and
+/// the reservation release run as a tracked background task: the charge stays held until
+/// the file is gone, but a stuck unlink must not hold this write's outcome hostage.
+fn abandon(
+    inner: &Arc<Inner>,
+    temporary: PathBuf,
+    digest: Digest,
+    charged: u64,
+    result: WriteResult,
+) -> WriteResult {
+    let cleanup = Arc::clone(inner);
+    spawn_tracked(inner, move || {
+        remove_temporary(&cleanup, &temporary);
+        release_reservation(&cleanup, digest, charged);
+    });
+    result
+}
+
 /// The write's one blocking task (D34): owns the temporary file, writes through a
 /// [`WRITE_BUFFER`] `BufWriter`, then validates in the same task.
 fn writer_blocking(
@@ -1593,29 +1689,13 @@ fn writer_blocking(
     size: u64,
     charged: u64,
 ) -> WriteResult {
-    let id = inner.next_tmp.fetch_add(1, Ordering::Relaxed);
-    let temporary = inner
-        .root
-        .join("tmp")
-        .join(format!("{}-{id}", std::process::id()));
+    let temporary = temporary_path(inner);
     let file = match StdFile::create(&temporary) {
         Ok(file) => file,
         Err(e) => {
             release_reservation(inner, digest, charged);
             return WriteResult::Io(Error::io("create", &temporary)(e));
         }
-    };
-    // The temporary's removal (retried until it lands) and the reservation release run
-    // as a tracked background task: the charge stays held until the file is gone, but
-    // a stuck unlink must not hold this write's outcome hostage.
-    let abandon = |result: WriteResult| -> WriteResult {
-        let cleanup = Arc::clone(inner);
-        let temporary = temporary.clone();
-        spawn_tracked(inner, move || {
-            remove_temporary(&cleanup, &temporary);
-            release_reservation(&cleanup, digest, charged);
-        });
-        result
     };
     let mut writer = BufWriter::with_capacity(WRITE_BUFFER, file);
     let mut bytes_seen = 0_u64;
@@ -1624,43 +1704,96 @@ fn writer_blocking(
             Some(WriteMsg::Chunk(chunk)) => {
                 bytes_seen = bytes_seen.saturating_add(len_u64(&chunk));
                 if bytes_seen > size {
-                    return abandon(WriteResult::Aborted);
+                    return abandon(inner, temporary, digest, charged, WriteResult::Aborted);
                 }
                 if let Err(e) = writer.write_all(&chunk) {
-                    return abandon(WriteResult::Io(Error::io("write", &temporary)(e)));
+                    let result = WriteResult::Io(Error::io("write", &temporary)(e));
+                    return abandon(inner, temporary, digest, charged, result);
                 }
             }
             Some(WriteMsg::Finish) => break,
-            None => return abandon(WriteResult::Aborted),
+            None => return abandon(inner, temporary, digest, charged, WriteResult::Aborted),
         }
     }
     if bytes_seen != size {
-        return abandon(WriteResult::Aborted);
+        return abandon(inner, temporary, digest, charged, WriteResult::Aborted);
     }
-    if let Err(e) = writer.flush() {
-        return abandon(WriteResult::Io(Error::io("write", &temporary)(e)));
+    match writer.into_inner() {
+        Ok(file) => validate(inner, file, temporary, destination, digest, size, charged),
+        Err(e) => {
+            let result = WriteResult::Io(Error::io("write", &temporary)(e.into_error()));
+            abandon(inner, temporary, digest, charged, result)
+        }
     }
+}
+
+/// The whole write of a small object in one blocking pass (D43): `data` is the complete
+/// body, already checked against the announced size, so there is nothing left to wait for.
+/// Runs the post-store sweep and free-disk sample here too, since the pass has no later
+/// stage to defer them to.
+fn write_small_blocking(
+    inner: &Arc<Inner>,
+    data: &[u8],
+    digest: Digest,
+    destination: &Path,
+    size: u64,
+    charged: u64,
+) -> WriteResult {
+    let temporary = temporary_path(inner);
+    let mut file = match StdFile::create(&temporary) {
+        Ok(file) => file,
+        Err(e) => {
+            release_reservation(inner, digest, charged);
+            return WriteResult::Io(Error::io("create", &temporary)(e));
+        }
+    };
+    if let Err(e) = file.write_all(data) {
+        let result = WriteResult::Io(Error::io("write", &temporary)(e));
+        return abandon(inner, temporary, digest, charged, result);
+    }
+    let result = validate(inner, file, temporary, destination, digest, size, charged);
+    if matches!(result, WriteResult::Stored) {
+        sweep_to_watermark(inner, digest);
+        refresh_free_disk(inner);
+    }
+    result
+}
+
+/// Syncs the finished temporary (`fsync` mode, D32), renames it into place and publishes
+/// it: the part of a write both paths share.
+fn validate(
+    inner: &Arc<Inner>,
+    file: StdFile,
+    temporary: PathBuf,
+    destination: &Path,
+    digest: Digest,
+    size: u64,
+    charged: u64,
+) -> WriteResult {
     if inner.options.durability == Durability::Fsync
-        && let Err(e) = writer.get_ref().sync_all()
+        && let Err(e) = file.sync_all()
     {
-        return abandon(WriteResult::Io(Error::io("fsync", &temporary)(e)));
+        let result = WriteResult::Io(Error::io("fsync", &temporary)(e));
+        return abandon(inner, temporary, digest, charged, result);
     }
-    drop(writer);
+    drop(file);
     // The parent is created before the validation lock, so a validation stuck in I/O is
     // observable (and admissions never wait for either).
     if let Some(parent) = destination.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        return abandon(WriteResult::Io(Error::io("create", parent)(e)));
+        let result = WriteResult::Io(Error::io("create", parent)(e));
+        return abandon(inner, temporary, digest, charged, result);
     }
     {
         // One validation section covers the rename and its publication (index commit,
         // reservation conversion, unpin), in validation → index order: a pending
-        // deletion or a competing writer can only run before the rename or after the
-        // entry exists, never between them (D12).
-        let _validation = inner.validation.lock().expect("validation lock poisoned");
+        // deletion or a competing writer of the same shard can only run before the rename
+        // or after the entry exists, never between them (D12).
+        let _validation = inner.validation.lock(digest);
         if let Err(e) = std::fs::rename(&temporary, destination) {
-            return abandon(WriteResult::Io(Error::io("rename", destination)(e)));
+            let result = WriteResult::Io(Error::io("rename", destination)(e));
+            return abandon(inner, temporary, digest, charged, result);
         }
         // The rename already made the object visible: a failed stat must not lose it.
         let modified = std::fs::metadata(destination)
@@ -1681,6 +1814,56 @@ fn writer_blocking(
     }
     inner.options.metrics.written_bytes(size);
     WriteResult::Stored
+}
+
+impl Reservation {
+    /// [`Reservation::write`] for an object of at most [`SMALL_WRITE`] bytes (D43): the body is
+    /// read into memory first, bounded by the announced size, then one blocking pass stores it.
+    /// Until that pass starts the reservation is unsettled, so a dropped future, a failed body
+    /// or a wrong length cancel it through `Drop` and nothing was ever created.
+    async fn write_small<S, E>(mut self, body: S) -> Outcome
+    where
+        S: Stream<Item = Result<Bytes, E>>,
+    {
+        let announced = usize::try_from(self.size).unwrap_or(usize::MAX);
+        let mut data = Vec::with_capacity(announced);
+        let mut body = pin!(body);
+        while let Some(chunk) = body.next().await {
+            let Ok(chunk) = chunk else {
+                return Outcome::Aborted;
+            };
+            if chunk.len() > announced - data.len() {
+                return Outcome::Aborted;
+            }
+            data.extend_from_slice(&chunk);
+        }
+        if data.len() != announced {
+            return Outcome::Aborted;
+        }
+        // From here the blocking pass owns settling the reservation on every path,
+        // including this future being dropped while it runs.
+        self.settled = true;
+        let inner = Arc::clone(&self.inner);
+        let (digest, destination, size, charged) = (
+            self.digest,
+            self.destination.clone(),
+            self.size,
+            self.charged,
+        );
+        let pass = Arc::clone(&inner);
+        let result = blocking_tracked(&inner, move || {
+            write_small_blocking(&pass, &data, digest, &destination, size, charged)
+        })
+        .await;
+        match result {
+            WriteResult::Stored => Outcome::Stored,
+            WriteResult::Aborted => Outcome::Aborted,
+            WriteResult::Io(e) => {
+                error!(error = %e, "PUT dropped after admission");
+                Outcome::Dropped(DropReason::Io)
+            }
+        }
+    }
 }
 
 impl Drop for Reservation {
@@ -1932,9 +2115,10 @@ mod tests {
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let inner = Arc::clone(&store.inner);
+        let slow = digest_of(&key("slow"));
         // Stands for a rename that takes a long time: it owns the validation lock.
         let stuck = std::thread::spawn(move || {
-            let _validation = inner.validation.lock().unwrap();
+            let _validation = inner.validation.lock(slow);
             locked_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         });
@@ -1989,7 +2173,7 @@ mod tests {
         let store = Store::open(dir.path(), options(MIB)).await.unwrap();
         ready(&store).await;
         let k = key("k");
-        let Admission::Reserved(reservation) = store.admit(&k, 4) else {
+        let Admission::Reserved(reservation) = store.admit(&k, 6) else {
             panic!("not admitted")
         };
         std::fs::remove_dir_all(dir.path().join("tmp")).unwrap();
@@ -3073,9 +3257,12 @@ mod tests {
     async fn refused_temporary_unlink_keeps_its_reservation() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path(), options(2 * BLOCK)).await.unwrap();
+        let store = Store::open(dir.path(), options(32 * BLOCK)).await.unwrap();
         ready(&store).await;
-        let Admission::Reserved(reservation) = store.admit(&key("t"), 10) else {
+        // Above the one-pass threshold: only the streaming path has a temporary while the
+        // body is still being read.
+        let size = SMALL_WRITE + 1;
+        let Admission::Reserved(reservation) = store.admit(&key("t"), size) else {
             panic!("not admitted")
         };
         let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(1);
@@ -3087,7 +3274,7 @@ mod tests {
         eventually("the temporary to exist", || temporaries(&dir) == 1).await;
         let tmp = dir.path().join("tmp");
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
-        // The body ends 5 bytes short of the 10 announced: the write aborts.
+        // The body ends short of the announced size: the write aborts.
         drop(sender);
         let outcome = writing.await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3096,7 +3283,8 @@ mod tests {
         assert_eq!(outcome, Outcome::Aborted);
         assert_eq!(present, 1, "the refused unlink was never exercised");
         assert_eq!(
-            held, BLOCK,
+            held,
+            charge(size),
             "the reservation was released while its temporary remained"
         );
         eventually("the retried unlink to release the reservation", || {
@@ -3612,5 +3800,186 @@ mod tests {
             "the purge deleted outside the naming scheme"
         );
         drop(store);
+    }
+
+    /// Waits until every background task, writer passes included, has ended.
+    async fn quiesce(store: &Store) {
+        eventually("background tasks to end", || {
+            store.inner.background.load(Ordering::Acquire) == 0
+        })
+        .await;
+    }
+
+    // D43: an object of at most 64 KiB is stored by one blocking pass with no channel; a
+    // larger one keeps the streaming path (D34).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn small_put_is_one_blocking_pass() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        ready(&store).await;
+        quiesce(&store).await;
+        let hooks = &store.inner.hooks;
+        let (dispatched, sent) = (&hooks.dispatches, &hooks.channel_sends);
+        let before = dispatched.load(Ordering::Relaxed);
+        let exact = usize::try_from(SMALL_WRITE).unwrap();
+        for (name, len) in [("tiny", 4), ("exact", exact)] {
+            assert_eq!(
+                put_vec(&store, &key(name), vec![7; len]).await,
+                Outcome::Stored
+            );
+            quiesce(&store).await;
+            assert_eq!(contents(&store, &key(name)).await.unwrap(), vec![7; len]);
+        }
+        assert_eq!(
+            dispatched.load(Ordering::Relaxed) - before,
+            2,
+            "a small PUT is not one blocking pass"
+        );
+        assert_eq!(
+            sent.load(Ordering::Relaxed),
+            0,
+            "a small body used a channel"
+        );
+
+        assert_eq!(
+            put_vec(&store, &key("large"), vec![7; exact + 1]).await,
+            Outcome::Stored
+        );
+        assert!(
+            sent.load(Ordering::Relaxed) > 0,
+            "a body above 64 KiB left the streaming path"
+        );
+    }
+
+    /// Two keys whose digests start with different bytes, and two that share one.
+    fn keys_by_shard() -> ((Key, Key), (Key, Key)) {
+        let keys: Vec<Key> = (0..8192).map(|i| key(&format!("shard/{i}"))).collect();
+        let shard = |k: &Key| k.digest()[0];
+        let apart = keys
+            .iter()
+            .find(|k| shard(k) != shard(&keys[0]))
+            .expect("8192 digests span several shards");
+        let same = keys[1..]
+            .iter()
+            .find(|k| shard(k) == shard(&keys[0]))
+            .expect("8192 digests collide on 256 shards");
+        (
+            (keys[0].clone(), apart.clone()),
+            (keys[0].clone(), same.clone()),
+        )
+    }
+
+    /// Starts a PUT of `data` under `name` and returns once it holds its validation lock,
+    /// paused before the index commit.
+    async fn put_paused_in_validation(
+        store: &Store,
+        name: &Key,
+    ) -> tokio::task::JoinHandle<Outcome> {
+        store
+            .inner
+            .hooks
+            .pause_publish
+            .store(true, Ordering::Release);
+        let writer = {
+            let (store, name) = (store.clone(), name.clone());
+            tokio::spawn(async move { put_vec(&store, &name, vec![1; 100]).await })
+        };
+        eventually("the writer to reach publication", || {
+            store.inner.hooks.publish_reached.load(Ordering::Acquire)
+        })
+        .await;
+        writer
+    }
+
+    // D43: a validation held in its critical section does not delay another shard's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn validations_of_different_shards_run_in_parallel() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        ready(&store).await;
+        let ((held, other), _) = keys_by_shard();
+        let first = put_paused_in_validation(&store, &held).await;
+        let second = {
+            let (store, other) = (store.clone(), other.clone());
+            tokio::spawn(async move { put_vec(&store, &other, vec![2; 100]).await })
+        };
+        let finished = tokio::time::timeout(Duration::from_secs(2), second).await;
+        store
+            .inner
+            .hooks
+            .publish_release
+            .store(true, Ordering::Release);
+        assert_eq!(
+            finished
+                .expect("a validation waited for another shard's")
+                .unwrap(),
+            Outcome::Stored
+        );
+        assert_eq!(first.await.unwrap(), Outcome::Stored);
+    }
+
+    // D12, D43: two validations of one shard still exclude each other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn validations_of_one_shard_exclude_each_other() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        ready(&store).await;
+        let (_, (held, same)) = keys_by_shard();
+        let first = put_paused_in_validation(&store, &held).await;
+        let second = {
+            let (store, same) = (store.clone(), same.clone());
+            tokio::spawn(async move { put_vec(&store, &same, vec![2; 100]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let overtook = second.is_finished();
+        store
+            .inner
+            .hooks
+            .publish_release
+            .store(true, Ordering::Release);
+        assert!(
+            !overtook,
+            "a validation ran inside another's critical section"
+        );
+        assert_eq!(first.await.unwrap(), Outcome::Stored);
+        assert_eq!(second.await.unwrap(), Outcome::Stored);
+    }
+
+    // A small PUT that fails after its temporary exists removes it and gives the room back.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn small_put_io_failure_cleans_up() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        ready(&store).await;
+        let k = key("blocked");
+        // A directory where the object must go makes the rename fail.
+        std::fs::create_dir_all(object_path(dir.path(), &k.digest())).unwrap();
+        assert_eq!(
+            put_vec(&store, &k, vec![1; 100]).await,
+            Outcome::Dropped(DropReason::Io)
+        );
+        eventually("the temporary and the room to be released", || {
+            temporaries(&dir) == 0 && accounted_total(&store) == 0
+        })
+        .await;
+        assert!(store.read(&k).await.unwrap().is_none());
+    }
+
+    // A small body longer than announced stores nothing and creates no file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn small_body_over_its_announced_size_stores_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options(MIB)).await.unwrap();
+        ready(&store).await;
+        let k = key("long");
+        let Admission::Reserved(reservation) = store.admit(&k, 4) else {
+            panic!("not admitted")
+        };
+        let outcome = reservation.write(body(&[b"abc", b"def"])).await;
+        assert_eq!(outcome, Outcome::Aborted);
+        eventually("the room to be released", || accounted_total(&store) == 0).await;
+        assert_eq!(temporaries(&dir), 0);
+        assert!(store.read(&k).await.unwrap().is_none());
     }
 }
