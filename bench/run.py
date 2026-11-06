@@ -105,6 +105,7 @@ def main():
     rows, pressure, versions, probes = [], [], {}, []
     containers = []
     pressure_monitor = None
+    sample_errors = []
     pressure_stop = threading.Event()
     run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=args.work_dir.resolve()))
     # An interrupted run still takes the same cleanup and writes its partial evidence.
@@ -183,8 +184,12 @@ def main():
                             def sample():
                                 while not stop.is_set():
                                     # docker top includes the master and all nginx workers, in KiB.
-                                    text = command("docker", "top", name, "-eo", "rss")
-                                    peak[0] = max(peak[0], sum(int(v) for v in text.splitlines()[1:]))
+                                    try:
+                                        text = command("docker", "top", name, "-eo", "rss")
+                                        peak[0] = max(peak[0], sum(int(v) for v in text.splitlines()[1:]))
+                                    except Exception as exc:
+                                        sample_errors.append(exc)
+                                        return
                                     stop.wait(0.1)
                             monitor = None
                             if method == "GET" and size == 33554432 and concurrency == 64:
@@ -202,6 +207,8 @@ def main():
                                 stop.set()
                                 if monitor:
                                     monitor.join()
+                            if sample_errors:
+                                raise RuntimeError("RSS sampling failed") from sample_errors[0]
                             rows.append(dict(server=server, size=size, method=method, concurrency=concurrency,
                                              repeat=repeat, peak_rss_kib=peak[0], load=os.getloadavg(), oha=result))
                             print(f"  {method} {size} c={concurrency} run={repeat}: {statistics(result)}", flush=True)
@@ -219,7 +226,11 @@ def main():
             start_time = time.monotonic()
             def disk_sample():
                 while not pressure_stop.is_set():
-                    allocated = int(command("du", "-s", "-B1", str(data)).split()[0])
+                    try:
+                        allocated = int(command("du", "-s", "-B1", str(data)).split()[0])
+                    except Exception as exc:
+                        sample_errors.append(exc)
+                        return
                     pressure.append(dict(server=server, seconds=time.monotonic() - start_time, allocated=allocated))
                     pressure_stop.wait(0.1)
             pressure_monitor = threading.Thread(target=disk_sample)
@@ -232,6 +243,8 @@ def main():
             pressure_monitor.join()
             pressure_monitor = None
             pressure_stop.clear()
+            if sample_errors:
+                raise RuntimeError("Disk sampling failed") from sample_errors[0]
             pressure.append(dict(server=server, seconds=time.monotonic() - start_time,
                                  allocated=int(command("du", "-s", "-B1", str(data)).split()[0])))
             probes.append(f"{server} pressure: {count} unique x 32 MiB, concurrency 16, statuses {statuses}")
@@ -272,7 +285,8 @@ def render(path, raw, metadata, versions, probes, rows, pressure, failure):
         statuses = row["oha"]["statusCodeDistribution"]
         good = sum(n for status, n in statuses.items() if 200 <= int(status) < 300)
         good_rps = good / row["oha"]["summary"]["total"]
-        lines.append(f"| {row['server']} | {row['method']} | {row['size']} | {row['concurrency']} | {row['repeat']} | {rps:.2f} | {good_rps * row['size'] / 1048576:.2f} | {latency['p50'] * 1000:.3f} | {latency['p99'] * 1000:.3f} | {errors:.3f} | {row['peak_rss_kib'] / 1024:.2f} |")
+        rss = f"{row['peak_rss_kib'] / 1024:.2f}" if row["peak_rss_kib"] else "—"
+        lines.append(f"| {row['server']} | {row['method']} | {row['size']} | {row['concurrency']} | {row['repeat']} | {rps:.2f} | {good_rps * row['size'] / 1048576:.2f} | {latency['p50'] * 1000:.3f} | {latency['p99'] * 1000:.3f} | {errors:.3f} | {rss} |")
     lines += ["", "## Repeatability", "", "Second throughput relative to first; |delta| <= 10% passes.", "",
               "| Server | Method | Bytes | c | Delta % | <=10% |", "|---|---|---:|---:|---:|---|"]
     for first, second in zip(rows[::2], rows[1::2]):
