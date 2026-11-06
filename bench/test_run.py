@@ -6,6 +6,7 @@ import tempfile
 import run
 import sys
 import unittest
+from unittest.mock import patch
 
 RUN = Path(__file__).with_name("run.py")
 
@@ -35,6 +36,32 @@ class GuardTests(unittest.TestCase):
         result = self.cli(f'import os, runpy, sys; os.getloadavg=lambda: (0, 0, 0); sys.argv=[{str(RUN)!r}, "--preflight-only"]; runpy.run_path({str(RUN)!r}, run_name="__main__")')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Preflight passed", result.stdout)
+
+
+class DiskSamplingTests(unittest.TestCase):
+    def test_disappearing_upload_does_not_abort_disk_sampling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            retained = root / "retained"
+            vanished = root / "temporary"
+            retained.write_bytes(b"x" * 4096)
+            vanished.write_bytes(b"x" * 4096)
+            expected = (root.stat().st_blocks + retained.stat().st_blocks) * 512
+            stat = Path.stat
+
+            def disappearing_stat(path, *args, **kwargs):
+                if path == vanished:
+                    path.unlink()
+                return stat(path, *args, **kwargs)
+
+            with patch.object(Path, "stat", disappearing_stat):
+                self.assertEqual(run.allocated_bytes(root), expected)
+
+    def test_disk_permission_errors_are_not_hidden(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(Path, "stat", side_effect=PermissionError("denied")):
+                with self.assertRaises(PermissionError):
+                    run.allocated_bytes(Path(directory))
 
 
 class ReportTests(unittest.TestCase):

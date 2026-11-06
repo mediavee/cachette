@@ -1,6 +1,6 @@
 # Reproducible local HTTP cache benchmark
 
-Run from a checkout on Linux x86_64 with Python 3, Git, Docker, `timeout`, `du`,
+Run from a checkout on Linux x86_64 with Python 3, Git, Docker, `timeout`,
 `df`, `findmnt`, `lsblk`, `uptime` and `nproc`. No Python packages are needed.
 Docker builds install the pinned clients and servers before measuring them.
 
@@ -59,10 +59,11 @@ whereas both cache servers authenticate it. No TLS is used.
   pages, so their sum can overcount. This is sampled peak RSS, not a kernel high
   water mark; it excludes page-cache memory and client memory.
 - Pressure starts with fresh server data: 3× the cap in distinct 32 MiB objects,
-  16 concurrent uploads, with allocated bytes sampled by `du -s -B1` every 100 ms
+  16 concurrent uploads, with allocated bytes (sum of `st_blocks * 512`) sampled every 100 ms
   through one second after uploads finish. The report includes all statuses and
-  time samples. `du` includes directories, metadata and temporary files, whereas
-  the configured caps account for blobs. Sampling can miss short overshoots.
+  time samples. This includes directories, metadata and temporary files, whereas
+  the configured caps account for blobs. Scans are not atomic: files unlinked by publication/eviction during a scan are
+  ignored; other I/O errors abort the run. Sampling can miss short overshoots.
   This scenario does not prove LRU order or reservation correctness.
 
 cachette is built from the **current checkout** using a static musl target in
@@ -121,4 +122,5 @@ python3 -B bench/run.py --preflight-only
 ```
 
 The CLI tests exercise both refusal paths before Docker and the free/quiet
-path. Disabling the preflight call must make the two refusal tests fail.
+path, correct error/goodput reporting, and disappearing temporary files during disk
+scans without hiding permission failures. Disabling the preflight call must make the two refusal tests fail.

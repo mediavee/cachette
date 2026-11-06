@@ -63,6 +63,21 @@ def statistics(data):
     return data["summary"]["requestsPerSec"], 100 * bad / total if total else 100
 
 
+def allocated_bytes(root):
+    total = 0
+    def walk_error(error):
+        if not isinstance(error, FileNotFoundError):
+            raise error
+    for directory, _, files in os.walk(root, onerror=walk_error):
+        for path in [Path(directory)] + [Path(directory) / name for name in files]:
+            try:
+                total += path.stat().st_blocks * 512
+            except FileNotFoundError:
+                # Upload publication and eviction can unlink a file during the scan.
+                continue
+    return total
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--servers", nargs="+", choices=PORTS, default=list(PORTS))
@@ -227,7 +242,7 @@ def main():
             def disk_sample():
                 while not pressure_stop.is_set():
                     try:
-                        allocated = int(command("du", "-s", "-B1", str(data)).split()[0])
+                        allocated = allocated_bytes(data)
                     except Exception as exc:
                         sample_errors.append(exc)
                         return
@@ -246,7 +261,7 @@ def main():
             if sample_errors:
                 raise RuntimeError("Disk sampling failed") from sample_errors[0]
             pressure.append(dict(server=server, seconds=time.monotonic() - start_time,
-                                 allocated=int(command("du", "-s", "-B1", str(data)).split()[0])))
+                                 allocated=allocated_bytes(data)))
             probes.append(f"{server} pressure: {count} unique x 32 MiB, concurrency 16, statuses {statuses}")
             command("docker", "rm", "-f", name)
             containers.remove(name)
@@ -294,7 +309,7 @@ def render(path, raw, metadata, versions, probes, rows, pressure, failure):
         r2, _ = statistics(second["oha"])
         delta = 100 * (r2 / r1 - 1) if r1 else float('inf')
         lines.append(f"| {first['server']} | {first['method']} | {first['size']} | {first['concurrency']} | {delta:.2f} | {'yes' if abs(delta) <= 10 else 'NO'} |")
-    lines += ["", "## Eviction pressure", "", "Allocated bytes from du include objects, temporary files, metadata and directory blocks.",
+    lines += ["", "## Eviction pressure", "", "Allocated bytes (sum of st_blocks × 512) include objects, temporary files, metadata and directory blocks. Scans are not atomic; vanished files are ignored.",
               "The configured cap accounts for blobs, not all these filesystem costs. nginx has no cap/evictor.", "",
               "| Server | Elapsed s | Allocated bytes |", "|---|---:|---:|"]
     lines += [f"| {p['server']} | {p['seconds']:.3f} | {p['allocated']} |" for p in pressure]
