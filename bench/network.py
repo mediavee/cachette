@@ -87,6 +87,8 @@ def coordinate(args):
     process = subprocess.Popen(["ssh", args.remote, shlex.join(remote)], stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, text=True)
     received = False
+    client_dir = tempfile.TemporaryDirectory(prefix="cachette-bench-client-")
+    prepared = None
     try:
         for line in process.stdout:
             message = json.loads(line)
@@ -94,25 +96,32 @@ def coordinate(args):
                 action = message["action"]
                 if action == "context":
                     response = context
-                elif action == "measure":
+                elif action == "prepare":
                     load = require_quiet(args.max_load)
                     before_ping = ping()
                     url = message["url"]
                     if not url.startswith(f"http://{address}:"):
                         raise RuntimeError("Refusing measurement outside remote Tailscale address")
-                    with tempfile.TemporaryDirectory(prefix="cachette-bench-client-") as directory:
-                        body = Path(directory) / "body"
-                        oha = [str(args.oha), "--no-tui", "--output-format", "json", "-z",
-                               f"{message['seconds']}s", "-w", "-t", "120s", "-c", str(message["concurrency"]),
-                               "-m", message["method"], "-H", f"Authorization: {AUTH}"]
-                        if message["body"] is not None:
-                            body.write_bytes(base64.b64decode(message["body"]))
-                            oha += ["-D", str(body)]
-                        before_cpu = cpu_ticks()
-                        result = json.loads(command(*oha, url))
-                        busy = cpu_busy(before_cpu, cpu_ticks())
-                    response = dict(oha=result, cpu_busy=busy, load=load, load_end=os.getloadavg(),
-                                    ping_before=before_ping, ping_after=ping())
+                    body = Path(client_dir.name) / "body"
+                    prepared = [str(args.oha), "--no-tui", "--output-format", "json", "-z",
+                                f"{message['seconds']}s", "-w", "-t", "120s", "-c", str(message["concurrency"]),
+                                "-m", message["method"], "-H", f"Authorization: {AUTH}"]
+                    if message["body"] is not None:
+                        body.write_bytes(base64.b64decode(message["body"]))
+                        prepared += ["-D", str(body)]
+                    prepared.append(url)
+                    response = dict(ping_before=before_ping, load=load)
+                elif action == "measure":
+                    if prepared is None:
+                        raise RuntimeError("No prepared measurement")
+                    load = require_quiet(args.max_load)
+                    before_cpu = cpu_ticks()
+                    result = json.loads(command(*prepared))
+                    busy = cpu_busy(before_cpu, cpu_ticks())
+                    prepared = None
+                    response = dict(oha=result, cpu_busy=busy, load=load, load_end=os.getloadavg())
+                elif action == "finish":
+                    response = dict(ping_after=ping())
                 elif action == "report":
                     if Path(message["name"]).name != message["name"]:
                         raise RuntimeError("Invalid report filename")
@@ -131,6 +140,7 @@ def coordinate(args):
         if process.wait(timeout=60) != 0 or not received:
             raise RuntimeError("Remote benchmark failed; inspect remote failed-*.md, not results/")
     finally:
+        client_dir.cleanup()
         process.stdin.close()
         process.stdout.close()
         if process.poll() is None:

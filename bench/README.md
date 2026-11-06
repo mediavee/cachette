@@ -85,10 +85,10 @@ cell: RTT samples and the direct endpoint or DERP route, not an inferred path.
 They record host versions, initial uptime, per-cell loads, useful MiB/s, p50/p99,
 errors and whole-host busy CPU percentages. CPU comes from cumulative Linux
 `/proc/stat` counters (idle+iowait counted idle), and macOS `host_statistics`
-CPU ticks. The mini interval brackets oha; dev2's interval brackets the control
-exchange, including body transfer and the pre/post ping probes. These are
-**different intervals**, include unrelated workloads and Tailscale, and do not
-attribute CPU to the server alone. A route can change during an HTTP interval.
+CPU ticks. The mini interval brackets oha; dev2's interval brackets the measure request
+and its reply, adding about one control-plane round trip. Body transfer and
+the pre/post ping probes are outside both intervals. These host-wide intervals
+include unrelated workloads and Tailscale and do not attribute CPU to the server alone. A route can change during an HTTP interval.
 
 ## Versions, durability and semantics
 

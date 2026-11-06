@@ -181,7 +181,10 @@ def exchange(message):
  assert 'error' not in result,result
  return result
 exchange(dict(action='context'))
-result=exchange(dict(action='measure',url='http://100.64.0.1:18081/fixture',method='PUT',body='YWJj',concurrency=16,seconds=1))
+prepared=exchange(dict(action='prepare',url='http://100.64.0.1:18081/fixture',method='PUT',body='YWJj',concurrency=16,seconds=1))
+result=exchange(dict(action='measure'))
+result.update(prepared)
+result.update(exchange(dict(action='finish')))
 exchange(dict(action='report',name='fixture.md',text=json.dumps(result)))
 """
         popen = subprocess.Popen
@@ -226,13 +229,18 @@ class ReportTests(unittest.TestCase):
             "summary": {"requestsPerSec": 5, "total": 2, "successRate": 0.9},
             "latencyPercentiles": {"p50": 0.01, "p99": 0.02},
         }
-        row = dict(server="fixture", method="GET", size=1048576, concurrency=1,
+        row = dict(server="cachette", durability="fsync", method="GET", size=1048576, concurrency=1,
                    repeat=1, peak_rss_kib=0, oha=evidence)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report.md"
             run.render(path, {"utc": "fixture", "host": "fixture"},
                        {}, [], [row], [], None)
-            self.assertIn("| 5.00 | 4.00 | 10.000 | 20.000 | 20.000 |", path.read_text())
+            text = path.read_text()
+            self.assertIn("| 5.00 | 4.00 | 10.000 | 20.000 | 20.000 |", text)
+            self.assertIn("| cachette | fsync | GET |", text)
+            raw = text.split("<details><summary>Raw evidence</summary>")[1].split("```json\n")[1].split("\n```")[0]
+            self.assertEqual(json.loads(raw)["rows"], [row])
+            self.assertEqual(list(Path(directory).iterdir()), [path])
 
 
 if __name__ == "__main__":

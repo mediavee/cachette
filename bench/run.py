@@ -288,11 +288,14 @@ def main():
                                 client = None
                                 if args.tailscale_worker:
                                     from network import cpu_ticks, cpu_busy
+                                    prepared = rpc(action="prepare", url=url, method=method,
+                                                   body=base64.b64encode(payload).decode() if method == "PUT" else None,
+                                                   concurrency=concurrency, seconds=args.seconds)
                                     cpu_start = cpu_ticks()
-                                    client = rpc(action="measure", url=url, method=method,
-                                                 body=base64.b64encode(payload).decode() if method == "PUT" else None,
-                                                 concurrency=concurrency, seconds=args.seconds)
+                                    client = rpc(action="measure")
                                     server_cpu = cpu_busy(cpu_start, cpu_ticks())
+                                    client.update(prepared)
+                                    client.update(rpc(action="finish"))
                                     result = client.pop("oha")
                                 else:
                                     result = json.loads(command(*oha, url))
