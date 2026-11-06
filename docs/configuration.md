@@ -153,7 +153,7 @@ A dropped PUT is logged at `warn`, or at `error` when the cause is an I/O failur
 ```
 <data_dir>/
   objects/<2 hex>/<64 hex>   one file per object, named by the BLAKE3 hash of its key
-  tmp/                       uploads in progress, emptied at every start
+  objects/<2 hex>/.tmp-<n>   uploads in progress, deleted at every start
   state                      durability mode of the run and whether it ended cleanly
   lock                       held with flock for the life of the process
 ```
