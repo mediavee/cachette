@@ -34,7 +34,8 @@ binaries ship with and runs the smoke tests against it.
   `histogram!` macros. Logs go through the non-blocking writer set up in `main.rs`: add no other
   sink.
 - Never a fully qualified name inline: import it. Comments say why, not what.
-- Every PUT the server does not store still answers 200 and reads the body to its end (D5, D7).
+- Every PUT the server does not store answers 413, or 200 to Gradle's `HttpBuildCache`, and reads
+  the body to its end unless `Expect: 100-continue` lets it answer first (D5, D7).
 
 ## Tests
 

@@ -34,8 +34,8 @@ data_dir = "/var/lib/cachette"
 # small for the builds it serves.
 max_size = "26GiB"
 
-# Largest object accepted. A bigger PUT is not stored but still answers 200, because Gradle turns
-# its remote cache off for the rest of the build on any other status. Never above `max_size`.
+# Largest object accepted. A bigger PUT is not stored and answers 413, or 200 to Gradle, which
+# turns its remote cache off for the rest of the build on any other status. Never above `max_size`.
 # max_object_size = "512MiB"
 
 # Free space the filesystem must keep: a PUT that would eat into it is dropped. It protects
