@@ -25,11 +25,15 @@
 //! * **Pinned keys (D12).** A key is not evictable from its reservation until it is stored or the
 //!   reservation is dropped. An eviction decided before an object was stored never deletes it: a
 //!   deletion still pending carries a generation, so it cannot remove a newer version.
-//! * **Atomic writes (D13).** The body goes to `tmp/<unique>`, then is renamed to the object path.
-//!   The object is visible only after the rename, and `201` follows it. Concurrent writes of one
+//! * **Atomic writes (D13).** The body goes to `objects/<2 hex>/.tmp-<unique>`, in the shard
+//!   directory of its destination, then is renamed to the object path: a rename within one
+//!   directory takes no file-system-wide lock, while one between two directories serialises
+//!   every PUT. The `.tmp-` prefix can never be an object name, which is hex. The object is
+//!   visible only after the rename, and `201` follows it. Concurrent writes of one
 //!   key all succeed, the last rename wins and the key is counted once. A reader that already
 //!   opened the file keeps the old version. The data directory is `flock`ed at [`Store::open`]
-//!   before `tmp/` is emptied.
+//!   before the start-up walk of `objects/` deletes every leftover `.tmp-*` file and indexes
+//!   none.
 //! * **Durability (D32).** A `state` file in the data directory records the durability mode of
 //!   the run and `clean = true|false`. [`Store::open`], under the `flock` and before any mutation
 //!   or served read, loads the previous state, then writes the new one with `clean = false` and
@@ -132,6 +136,8 @@ const WRITE_BUFFER: usize = 64 * 1024;
 const SMALL_WRITE: u64 = 64 * 1024;
 /// Validation locks: one per leading digest byte, like the fan-out of `objects/` (D43).
 const VALIDATION_SHARDS: usize = 256;
+/// Name prefix of a file being written (D13). Object names are hex, so it never collides.
+const TEMP_PREFIX: &str = ".tmp-";
 /// Chunks a streaming read may have in flight: at most twice [`READ_CHUNK`] bytes per reader.
 const READ_CHANNEL_DEPTH: usize = 2;
 
@@ -922,7 +928,7 @@ async fn open_object(path: &Path) -> Result<Option<Object>, Error> {
 /// between refusals: only a successful unlink or `ENOENT` ends it, so the caller releases
 /// a charge only once its file is gone (D12). A closing store admits nothing more and
 /// stops retrying instead, so `close` never waits on a refusal that may not lift; the file
-/// left behind is cleared (`tmp/`) or indexed again (`objects/`) at the next start-up.
+/// left behind is deleted (a `.tmp-*` file) or indexed again (an object) at the next start-up.
 fn retry_unlink(inner: &Inner, path: &Path, mut attempt: impl FnMut() -> io::Result<()>) {
     let mut delay = Duration::from_millis(10);
     loop {
@@ -1230,13 +1236,6 @@ fn open_blocking(root: PathBuf, options: Options) -> Result<Inner, Error> {
             clean: false,
         },
     )?;
-    let tmp = root.join("tmp");
-    match std::fs::remove_dir_all(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::io("clear", &tmp)(e)),
-    }
-    std::fs::create_dir_all(&tmp).map_err(Error::io("create", &tmp))?;
     #[cfg(target_os = "linux")]
     let objects_dir = StdFile::open(&objects).map_err(Error::io("open", &objects))?;
     Ok(Inner {
@@ -1305,6 +1304,16 @@ fn scan_shard(shard: &Path, out: &mut Vec<Scanned>) -> Result<(), Error> {
             warn!(path = %path.display(), "unexpected entry under objects/, ignored");
             continue;
         };
+        if name.starts_with(TEMP_PREFIX) {
+            // An upload a previous run never finished. Nothing writes during the scan:
+            // admissions answer `not_ready` until it ends (D14).
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::io("delete", &path)(e)),
+            }
+            continue;
+        }
         let Some(digest) = parse_digest(name) else {
             warn!(path = %path.display(), "unexpected entry under objects/, ignored");
             continue;
@@ -1652,13 +1661,23 @@ impl Reservation {
     }
 }
 
-/// The path of a fresh temporary file under `tmp/`.
-fn temporary_path(inner: &Inner) -> PathBuf {
+/// The path of a fresh temporary file next to `destination` (D13).
+fn temporary_path(inner: &Inner, destination: &Path) -> PathBuf {
     let id = inner.next_tmp.fetch_add(1, Ordering::Relaxed);
-    inner
-        .root
-        .join("tmp")
-        .join(format!("{}-{id}", std::process::id()))
+    destination.with_file_name(format!("{TEMP_PREFIX}{id}"))
+}
+
+/// Creates the temporary, and its shard directory the first time the shard is written.
+fn create_temporary(temporary: &Path) -> io::Result<StdFile> {
+    match StdFile::create(temporary) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Some(shard) = temporary.parent() {
+                std::fs::create_dir_all(shard)?;
+            }
+            StdFile::create(temporary)
+        }
+        created => created,
+    }
 }
 
 /// Ends a write that stored nothing. The temporary's removal (retried until it lands) and
@@ -1689,8 +1708,8 @@ fn writer_blocking(
     size: u64,
     charged: u64,
 ) -> WriteResult {
-    let temporary = temporary_path(inner);
-    let file = match StdFile::create(&temporary) {
+    let temporary = temporary_path(inner, destination);
+    let file = match create_temporary(&temporary) {
         Ok(file) => file,
         Err(e) => {
             release_reservation(inner, digest, charged);
@@ -1739,8 +1758,8 @@ fn write_small_blocking(
     size: u64,
     charged: u64,
 ) -> WriteResult {
-    let temporary = temporary_path(inner);
-    let mut file = match StdFile::create(&temporary) {
+    let temporary = temporary_path(inner, destination);
+    let mut file = match create_temporary(&temporary) {
         Ok(file) => file,
         Err(e) => {
             release_reservation(inner, digest, charged);
@@ -1777,14 +1796,6 @@ fn validate(
         return abandon(inner, temporary, digest, charged, result);
     }
     drop(file);
-    // The parent is created before the validation lock, so a validation stuck in I/O is
-    // observable (and admissions never wait for either).
-    if let Some(parent) = destination.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        let result = WriteResult::Io(Error::io("create", parent)(e));
-        return abandon(inner, temporary, digest, charged, result);
-    }
     {
         // One validation section covers the rename and its publication (index commit,
         // reservation conversion, unpin), in validation → index order: a pending
@@ -1966,8 +1977,28 @@ mod tests {
         Some(data)
     }
 
+    fn is_temporary(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(TEMP_PREFIX))
+    }
+
+    /// The only shard directory that holds a file being written.
+    fn temporary_dir(dir: &TempDir) -> PathBuf {
+        walk(&dir.path().join("objects"))
+            .iter()
+            .find(|path| is_temporary(path))
+            .and_then(|path| path.parent())
+            .expect("a temporary exists")
+            .to_path_buf()
+    }
+
+    /// Files being written, which live next to their destination under `objects/`.
     fn temporaries(dir: &TempDir) -> usize {
-        std::fs::read_dir(dir.path().join("tmp")).unwrap().count()
+        walk(&dir.path().join("objects"))
+            .iter()
+            .filter(|path| is_temporary(path))
+            .count()
     }
 
     /// Waits for `condition`, which a cancelled write reaches on the blocking pool.
@@ -2176,7 +2207,12 @@ mod tests {
         let Admission::Reserved(reservation) = store.admit(&k, 6) else {
             panic!("not admitted")
         };
-        std::fs::remove_dir_all(dir.path().join("tmp")).unwrap();
+        // A file where the shard directory must be: the temporary cannot be created.
+        let shard = object_path(dir.path(), &k.digest())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::write(&shard, b"").unwrap();
         let drained = Arc::new(AtomicU64::new(0));
         let counter = Arc::clone(&drained);
         let chunks = stream::iter(0..3).map(move |_| {
@@ -2289,21 +2325,22 @@ mod tests {
         }
     }
 
-    /// Charged bytes of every file under `objects/` and `tmp/`: the D12 disk measure.
+    /// Charged bytes of every file under `objects/`, temporaries included: the D12 disk measure.
     fn disk_charged(dir: &Path) -> u64 {
         let mut total = 0_u64;
-        for sub in ["objects", "tmp"] {
-            for path in walk(&dir.join(sub)) {
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    total = total.saturating_add(charge(meta.len()));
-                }
+        for path in walk(&dir.join("objects")) {
+            if let Ok(meta) = std::fs::metadata(&path) {
+                total = total.saturating_add(charge(meta.len()));
             }
         }
         total
     }
 
     fn object_files(dir: &Path) -> usize {
-        walk(&dir.join("objects")).len()
+        walk(&dir.join("objects"))
+            .iter()
+            .filter(|path| !is_temporary(path))
+            .count()
     }
 
     // Criterion 1: the measured disk occupation never exceeds `max_size`.
@@ -2538,10 +2575,18 @@ mod tests {
         assert_eq!(put(&store, &key("keep"), b"data").await, Outcome::Stored);
         store.close().await.unwrap();
         drop(store);
-        std::fs::write(dir.path().join("tmp").join("partial"), b"truncated upload").unwrap();
+        let shard = object_path(dir.path(), &key("keep").digest())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::write(shard.join(".tmp-7"), b"truncated upload").unwrap();
         let reopened = open_retried(dir.path(), options(MIB)).await;
-        assert_eq!(temporaries(&dir), 0, "tmp/ was not emptied at start-up");
         ready(&reopened).await;
+        assert_eq!(
+            temporaries(&dir),
+            0,
+            "a leftover survived the start-up walk"
+        );
         assert_eq!(reopened.stats().entries, 1);
         assert_eq!(
             contents(&reopened, &key("keep")).await.as_deref(),
@@ -3272,7 +3317,7 @@ mod tests {
         let writing = tokio::spawn(reservation.write(input));
         sender.send(Ok(Bytes::from_static(b"short"))).await.unwrap();
         eventually("the temporary to exist", || temporaries(&dir) == 1).await;
-        let tmp = dir.path().join("tmp");
+        let tmp = temporary_dir(&dir);
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
         // The body ends short of the announced size: the write aborts.
         drop(sender);

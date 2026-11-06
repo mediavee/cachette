@@ -105,7 +105,7 @@ async fn cell(size: u64, tasks: u64) -> (u64, Duration, Duration) {
 #[ignore = "micro-benchmark, run by hand"]
 async fn put_bench() {
     for size in [4 * 1024, 64 * 1024] {
-        for tasks in [16, 64] {
+        for tasks in [1, 16, 64] {
             let (rate, p50, p99) = cell(size, tasks).await;
             println!(
                 "put_bench mode={:?} size={}KiB tasks={tasks} rate={rate}/s p50={p50:?} p99={p99:?}",
