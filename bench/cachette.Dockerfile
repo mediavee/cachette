@@ -3,7 +3,7 @@ RUN apk add --no-cache musl-dev cmake make perl
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --locked --release --target x86_64-unknown-linux-musl
+RUN cargo build --locked --release --jobs 2 --target x86_64-unknown-linux-musl
 FROM scratch
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/cachette /cachette
 ENTRYPOINT ["/cachette"]
