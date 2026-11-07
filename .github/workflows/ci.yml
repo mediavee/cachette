@@ -59,3 +59,26 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --target x86_64-unknown-linux-musl
+
+  public:
+    name: public repo hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The design notes behind this repo are not public: a reference to them is a dead end for
+      # every reader, so a comment states its reason instead.
+      - run: |
+          if git grep -nIP '\bD[0-9]{1,2}\b' -- . ':!Cargo.lock' ':!bench/results' \
+             || git grep -nIi 'chan[t]ier' -- . ':!bench/results'; then
+            echo "::error::reference to private design notes: state the reason in place"
+            exit 1
+          fi
+
+  bench-image:
+    name: bench image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The bench builds cachette from source through its own ignore file; nothing else
+      # builds this image, so a change to the release image context can break it unseen.
+      - run: docker build -f bench/cachette.Dockerfile -t cachette-bench .
