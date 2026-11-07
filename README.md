@@ -274,7 +274,7 @@ and p99: [Throughput and latency, lines 75 to 322](bench/results/2026-11-06T2045
 
 The loopback numbers above say nothing about a build. [`bench/gradle.py`](bench/gradle.py) runs
 the build a CI runs, `build`, on a private multi-module Gradle project (13 Gradle projects: the
-root and 12 modules; 212 tasks per build), with this machine as the client and cachette on a Linux
+root and 12 modules; 212 tasks per build), with a macOS arm64 client and cachette on a Linux
 host reached through a VPN between the two machines. Gradle's local cache was off and the daemon
 too, as on a fresh runner. Every build was a clean build of a fresh copy. Five repetitions of a
 baseline (no remote cache) and a hit (read token, another directory), after one fill build
@@ -294,7 +294,7 @@ time saved is inside the noise**. The 10 lookups that missed every time are most
 tasks of nine modules and one `shadowJar`, the executed tasks of kinds that other modules got from
 the cache; the report does not name them per lookup. Why they missed was not investigated (a
 guess: an input that holds the project path). The largest
-saving, 192 s, is the repetition where the baseline took 369.6 s with this machine at load 15
+saving, 192 s, is the repetition where the baseline took 369.6 s with the client at load 15
 (its one-minute load before the builds ranged from 6.1 to 21.4, the server host's from 0.01 to
 0.66), so it measures the load as much as the cache. Where the remaining 167 s go was not profiled.
 
@@ -303,7 +303,9 @@ What this run does not show:
 - **One project, one client, one network path**, five repetitions, on a shared machine. It is not
   a statement about builds in general, nor about the VPN: the round trip is the one measured here.
 - **Whether the misses are the project's or the cache's.** The same keys were not compared across
-  the two directories. A CI that builds from the same path each time may hit more.
+  the two directories.
+- **A CI that always checks out to the same path.** The hit builds ran from a different directory
+  than the fill, on purpose. Tasks that missed here may hit there; this run does not measure that.
 - **The cost of transfers alone.** Nothing times the 60 MiB read apart from the build.
 - **Pushes under load, a full disk, eviction, TLS, Maven or Bazel.** The cache stayed at 1.7 % of
   its 4 GiB cap.

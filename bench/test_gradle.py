@@ -279,8 +279,33 @@ class ReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             scrubber = gradle.Scrubber(Path(directory) / "secretproject")
             scrubber.text = lambda value: value
+            data = self.data()
+            data["meta"]["tasks"] = "build secretproject"
             with self.assertRaisesRegex(gradle.Refused, "identifying name"):
-                self.render(self.data(), scrubber)
+                self.render(data, scrubber)
+
+    def test_a_custom_task_name_never_reaches_the_report(self):
+        outcomes = {":lib:compileJava": "FROM-CACHE", ":lib:gadgetReport": "EXECUTED",
+                    ":lib:compileWidgetJava": "FROM-CACHE", ":app:gadgetReport": "EXECUTED",
+                    ":wibbleJar": "EXECUTED", ":build": "UP-TO-DATE"}
+        data = self.data()
+        data["builds"] = [self.build("baseline", 1, 100.0, outcomes), self.build("hit", 1, 40.0, outcomes)]
+        with tempfile.TemporaryDirectory() as directory:
+            text = self.render(data, gradle.Scrubber(Path(directory) / "demo"))
+        for custom in ("gadgetReport", "compileWidgetJava", "wibbleJar"):
+            self.assertNotIn(custom.lower(), text.lower())
+        names = gradle.raw_data(text)["builds"][0]["outcomes"]
+        self.assertEqual(set(names), {"module-01:task-01", "module-02:task-02", "module-02:compileJava",
+                                      "module-02:task-01", "root:build", "root:task-03"})
+        self.assertEqual(gradle.raw_data(text)["builds"][1]["outcomes"], names)
+
+    def test_custom_names_are_numbered_by_first_appearance_and_keep_their_number(self):
+        builds = [{"outcomes": {"m:zeta": "EXECUTED", "m:compileJava": "EXECUTED", "m:alpha": "EXECUTED"}},
+                  {"outcomes": {"m:beta": "EXECUTED", "n:zeta": "FROM-CACHE"}}]
+        gradle.neutral_names(builds)
+        self.assertEqual(builds[0]["outcomes"], {"m:task-01": "EXECUTED", "m:compileJava": "EXECUTED",
+                                                  "m:task-02": "EXECUTED"})
+        self.assertEqual(builds[1]["outcomes"], {"m:task-03": "EXECUTED", "n:task-02": "FROM-CACHE"})
 
     def test_name_and_host_come_from_the_machine_label(self):
         host, name = gradle.report_identity("2026-11-06T204503Z")

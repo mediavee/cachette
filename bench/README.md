@@ -71,7 +71,7 @@ that no recorded build downloads dependencies. Then, with the same tasks each ti
 2. each repetition, **baseline** (no remote cache) and **hit** (remote cache, read token, another
    directory), in alternating order so that both see the same drift.
 
-A repetition does not start while this machine's one-minute load is above `--max-client-load` (16)
+A repetition does not start while the client's one-minute load is above `--max-client-load` (16)
 or the server's above `--max-server-load` (8), read from `--server-load-command`: any command that
 prints the server's `/proc/loadavg`. `--max-wait` (two hours) is the total wait; the report says
 what ran when it ran out. `--gradle-arg` adds an argument to every build.
