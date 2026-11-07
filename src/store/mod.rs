@@ -183,7 +183,7 @@ impl Error {
     }
 }
 
-/// Why a PUT was answered 200 without being stored (D5). The label of `puts_dropped_total`.
+/// Why a PUT was not stored (D5). The label of `puts_dropped_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DropReason {
     /// The announced size is above `max_object_size`.
@@ -344,6 +344,8 @@ struct Hooks {
     hold_scan: AtomicBool,
     /// Free-disk samples wait while this is set, keeping the last one stale.
     hold_free_disk: AtomicBool,
+    /// Free-disk samples report this instead of asking the file system.
+    free_disk: Mutex<Option<u64>>,
     /// `close` pauses at this point until `close_release`.
     pause_close_at: Mutex<Option<ClosePoint>>,
     close_reached: AtomicBool,
@@ -546,6 +548,19 @@ fn sample_free_disk(path: &Path) -> u64 {
     }
 }
 
+fn free_disk_now(inner: &Inner) -> u64 {
+    #[cfg(test)]
+    if let Some(free) = *inner
+        .hooks
+        .free_disk
+        .lock()
+        .expect("free disk hook poisoned")
+    {
+        return free;
+    }
+    sample_free_disk(&inner.root)
+}
+
 /// Samples free disk space off the request path, so `admit` does no I/O (D7). The mark is
 /// read before the sample, so every reservation the sample may miss stays debited.
 fn refresh_free_disk(inner: &Inner) {
@@ -558,7 +573,7 @@ fn refresh_free_disk(inner: &Inner) {
         .lock()
         .expect("index lock poisoned")
         .free_disk_mark();
-    let free = sample_free_disk(&inner.root);
+    let free = free_disk_now(inner);
     inner
         .index
         .lock()
@@ -3511,24 +3526,25 @@ mod tests {
     async fn min_free_disk_recovers_after_space_is_freed() {
         const MIB128: u64 = 128 * 1024 * 1024;
         let dir = TempDir::new().unwrap();
-        let free = sample_free_disk(dir.path());
-        assert!(
-            free > 4 * MIB128,
-            "not enough free disk for this test: {free}"
-        );
         let mut opts = options(1024 * MIB);
-        let min_free_disk = free - MIB128;
+        let min_free_disk = 2 * MIB128;
         opts.min_free_disk = min_free_disk;
         let store = Store::open(dir.path(), opts).await.unwrap();
+        ready(&store).await;
+        // The host's own free space never enters the test: every sample reads this.
+        let set_free = |free: u64| {
+            *store.inner.hooks.free_disk.lock().unwrap() = Some(free);
+        };
+        set_free(4 * MIB128);
+        refresh_free_disk(&store.inner);
         assert_eq!(
             put_vec(&store, &key("x"), vec![1; 10]).await,
             Outcome::Stored
         );
-        let ballast = dir.path().join("ballast");
-        std::fs::write(&ballast, vec![7_u8; usize::try_from(2 * MIB128).unwrap()]).unwrap();
+        set_free(MIB128);
         // Admitted on the stale sample; its commit re-samples after answering.
         put_vec(&store, &key("y"), vec![1; 10]).await;
-        eventually("the sample to see the ballast", || {
+        eventually("the sample to see the lost space", || {
             store.inner.index.lock().unwrap().known_free_disk() < min_free_disk
         })
         .await;
@@ -3536,7 +3552,7 @@ mod tests {
             put_vec(&store, &key("z"), vec![1; 10]).await,
             Outcome::Dropped(DropReason::NoSpace)
         );
-        std::fs::remove_file(&ballast).unwrap();
+        set_free(4 * MIB128);
         let mut recovered = false;
         for _ in 0..100 {
             if put_vec(&store, &key("w"), vec![1; 10]).await == Outcome::Stored {
