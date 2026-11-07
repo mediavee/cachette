@@ -44,6 +44,44 @@ Containers and data are removed in `finally`, including SIGTERM. Images/build
 cache remain. SIGKILL, host failure or Docker failure can prevent cleanup:
 inspect the run's named resources before removing them; never stop another service.
 
+## A real Gradle build over a real network
+
+`gradle.py` measures what the loopback runs cannot: a clean Gradle build with and without the
+remote cache, against a server on another machine. Python's standard library, Gradle and the
+project are all it needs. It assumes no VPN product, host or path.
+
+```sh
+BENCH_WRITE_TOKEN=… BENCH_READ_TOKEN=… python3 -B bench/gradle.py \
+  --project /path/to/project --url http://server:5071 --tasks "build -x test" --repetitions 5 \
+  --server-load-command "ssh server cat /proc/loadavg"
+```
+
+The tokens come from the environment, never from the command line. The server must be freshly
+started: the script reads `cachette_entries` on `/metrics` and refuses to run unless it is 0.
+`BENCH_METRICS_TOKEN` is sent as a bearer token when `/metrics` is protected.
+
+Every build is a clean build of a fresh copy of the project in its own directory
+(`--exclude`, repeatable, names what the copy leaves out: `build`, `.gradle` and `.kotlin` by
+default). Gradle's local cache is disabled by an init script, so the project is left untouched, and
+the daemon is off for every build. An unrecorded warm-up build fills a private Gradle user home so
+that no recorded build downloads dependencies. Then, with the same tasks each time:
+
+1. **fill**, once: remote cache with push and the write token;
+2. each repetition, **baseline** (no remote cache) and **hit** (remote cache, read token, another
+   directory), in alternating order so that both see the same drift.
+
+A repetition does not start while this machine's one-minute load is above `--max-client-load` (16)
+or the server's above `--max-server-load` (8), read from `--server-load-command`: any command that
+prints the server's `/proc/loadavg`. `--max-wait` (two hours) is the total wait; the report says
+what ran when it ran out. `--gradle-arg` adds an argument to every build.
+
+The report in `results/<utc>-gradle-<machine label>.md` has the setup, the wall time of every build,
+the outcome of every task (`FROM-CACHE`, executed, up-to-date, no-source), the hit rate, baseline
+against hit with its spread, the round trip (`GET /healthz` on a kept-alive connection), the loads
+and the server's `/metrics` before and after. Module names, the project name and the machines are
+replaced by neutral labels before anything is written, and a last check refuses a report that
+still holds one. The tests: `python3 -B -m unittest discover -s bench -p 'test_gradle.py' -v`.
+
 ## Versions, durability and semantics
 
 | Variant | Durability used in tables | Configuration |
