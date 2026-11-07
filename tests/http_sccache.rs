@@ -1,5 +1,5 @@
-//! Black-box tests of the `WebDAV` subset sccache needs (D8) and of key handling (D9, D10). The
-//! sequence is the one opendal 0.58.1 sends for sccache 0.19 (`sccache-webdav.md` of the chantier).
+//! Black-box tests of the `WebDAV` subset sccache needs and of key handling. The
+//! sequence is the one opendal 0.58.1 sends for sccache 0.19.
 
 mod common;
 

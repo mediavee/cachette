@@ -217,7 +217,7 @@ promise, which is why the assumptions above are listed.
 ```sh
 docker run -d --name cachette \
   -v cachette-data:/data -p 5071:5071 \
-  -e CACHETTE_MAX_SIZE=26GiB \
+  -e CACHETTE_MAX_SIZE=20GiB \
   -e CACHETTE_TOKENS="ci-main:write:<secret>,developers:read:<secret>" \
   --stop-timeout 120 \
   ghcr.io/mediavee/cachette

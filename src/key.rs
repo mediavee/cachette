@@ -86,7 +86,7 @@ impl Key {
     }
 
     /// The blake3 digest of the normalised key: the store's index key, and the name of the
-    /// object's file through [`object_path`] (D9).
+    /// object's file through [`object_path`].
     pub(crate) fn digest(&self) -> [u8; 32] {
         *blake3::hash(self.0.as_bytes()).as_bytes()
     }
@@ -173,7 +173,7 @@ mod tests {
 
     use super::*;
 
-    /// Normalisation as it was before D39: always builds a `String`. Kept as the specification
+    /// Normalisation that always builds a `String`. Kept as the specification
     /// the borrowing implementation must agree with, byte for byte.
     fn reference_new(decoded: &str) -> Result<String, KeyError> {
         let mut normalised = String::with_capacity(decoded.len().min(MAX_KEY_BYTES));
@@ -212,7 +212,7 @@ mod tests {
         reference_new(&decoded)
     }
 
-    /// The on-disk path of a key, from its text alone: the digest D9 names the file by.
+    /// The on-disk path of a key, from its text alone: the digest names the file.
     fn reference_path(key: &str) -> PathBuf {
         let digest = blake3::hash(key.as_bytes()).to_hex();
         let digest = digest.as_str();
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_what_d9_lists() {
+    fn refuses_invalid_keys() {
         assert_eq!(Key::new(""), Err(KeyError::Empty));
         assert_eq!(Key::new("///"), Err(KeyError::Empty));
         assert_eq!(Key::new("a/./b"), Err(KeyError::DotSegment));

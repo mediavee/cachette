@@ -1,4 +1,4 @@
-//! The in-memory index: a digest map plus an intrusive LRU list (D15, D35).
+//! The in-memory index: a digest map plus an intrusive LRU list.
 //!
 //! Every operation is O(1). The map key is the blake3 digest itself with a trivial hasher,
 //! because a digest is already uniform; no key text or path is copied into an entry.
@@ -82,7 +82,7 @@ pub(super) struct Hit {
 
 /// The index behind the store's one `Mutex`.
 ///
-/// A mutex rather than an actor (D15): every critical section is a handful of O(1) map and
+/// A mutex rather than an actor: every critical section is a handful of O(1) map and
 /// list operations, so a channel round-trip per request would cost more than the work.
 #[derive(Debug)]
 pub(super) struct Index {
@@ -102,7 +102,7 @@ pub(super) struct Index {
     /// Keys with a PUT in flight, by digest, with their reservation count. Never evictable.
     pins: DigestMap<u32>,
     next_generation: u64,
-    /// Free disk bytes at the last `statvfs` (D12).
+    /// Free disk bytes at the last `statvfs`.
     free_disk: u64,
     /// Charged bytes ever admitted: a monotonic counter.
     admitted: u64,
@@ -131,7 +131,7 @@ impl Index {
     }
 
     /// Free disk bytes the store may still count on: the last sample, minus every
-    /// reservation admitted since it or in flight when it was taken (D12). A stale sample
+    /// reservation admitted since it or in flight when it was taken. A stale sample
     /// can only under-count, never let an admission below `min_free_disk`.
     pub(super) fn known_free_disk(&self) -> u64 {
         let unseen = self.admitted.saturating_sub(self.sampled_admitted);
@@ -161,12 +161,12 @@ impl Index {
         u64::try_from(self.map.len()).unwrap_or(u64::MAX)
     }
 
-    /// `vivant` in D12: committed plus reserved bytes.
+    /// Live bytes: committed plus reserved.
     pub(super) fn live(&self) -> u64 {
         self.size.saturating_add(self.reserved)
     }
 
-    /// Every byte the D12 hard bound counts: `vivant` plus bytes being deleted.
+    /// Every byte the hard bound counts: live bytes plus bytes being deleted.
     pub(super) fn charged_total(&self) -> u64 {
         self.live().saturating_add(self.pending)
     }
@@ -324,7 +324,7 @@ impl Index {
 
     /// Every entry whose in-memory recency is not persisted yet, with its generation. The
     /// caller writes the `mtime`s outside the lock and settles each; used at a clean
-    /// shutdown (D14).
+    /// shutdown.
     pub(super) fn late_touches(&self) -> Vec<(Digest, SystemTime, u64)> {
         self.slots
             .iter()

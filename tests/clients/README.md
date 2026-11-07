@@ -1,7 +1,7 @@
 # Real clients against the real binary
 
-Each script starts its own throwaway `cachette` (random tokens, temporary data directory, ports
-from the chantier table) and drives the genuine client. Nothing is installed globally.
+Each script starts its own throwaway `cachette` (random tokens, temporary data directory, fixed
+local ports) and drives the genuine client. Nothing is installed globally.
 
 | Script | What it proves |
 |---|---|

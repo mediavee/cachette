@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn every_recorder_emits_its_d18_name() {
+    fn every_recorder_emits_its_documented_name() {
         let text = scrape(|metrics| {
             metrics.request(&Method::GET, 200, Duration::from_millis(3));
             metrics.hit();

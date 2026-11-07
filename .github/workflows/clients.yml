@@ -1,7 +1,7 @@
 name: clients
 
-# The real clients against the real binary: Gradle (the version our main project pins, and the latest 8.x)
-# and the pinned sccache release. No private source is built here.
+# The real clients against the real binary: Gradle (9.8.1 and the latest 8.x)
+# and the pinned sccache release. Only the demo projects of this repository are built.
 on:
   push:
     branches: [main]
@@ -41,7 +41,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - name: Roundtrip, D5 and read-token push
+      - name: Roundtrip, d5 and read-token push
         run: tests/clients/gradle/run.sh
       # The check must go red on a cache that holds nothing, or a pass proves nothing.
       - name: Control, empty server must fail

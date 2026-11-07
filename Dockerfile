@@ -7,7 +7,7 @@
 # Run it with the settings as environment variables, `CACHETTE_MAX_SIZE` and a token being the only
 # mandatory ones (`CACHETTE_TOKENS="ci:write:...,dev:read:..."`):
 #
-#   docker run -v cachette-data:/data -p 5071:5071 -e CACHETTE_MAX_SIZE=26GiB \
+#   docker run -v cachette-data:/data -p 5071:5071 -e CACHETTE_MAX_SIZE=20GiB \
 #     -e CACHETTE_TOKENS=... --stop-timeout 120 ghcr.io/mediavee/cachette
 #
 # `--stop-timeout` matters: on SIGTERM the server drains and syncs the disk, and under the default

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real Gradle against a real cachette (D26): relocation, D5 and the read-token push.
+# Real Gradle against a real cachette: relocation, a refused object (d5) and the read-token push.
 #
 #   tests/clients/gradle/run.sh [roundtrip|d5|read-push ...]    (default: all three)
 #
@@ -8,7 +8,7 @@
 #   GRADLE_VERSION     "9.8.1", or "8" for the latest 8.x; default: the gradle on PATH
 #   CLIENTS_SKIP_WARMUP=1   skips the build that fills the cache: every check on hits must then
 #                      fail, which proves the script goes red on an empty server
-# Ports 18090 (roundtrip, read-push) and 18091 (d5), from the chantier port table.
+# Ports 18090 (roundtrip, read-push) and 18091 (d5).
 set -euo pipefail
 
 CLIENTS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -89,13 +89,13 @@ roundtrip() { # EXPECT_CONTINUE
     assert_ge "server hits" "$(metric cachette_hits_total)" 4
 }
 
-# D5: an output larger than max_object_size and than any socket buffer is dropped, and Gradle gets
+# d5: an output larger than max_object_size and than any socket buffer is dropped, and Gradle gets
 # a 200 (any other status turns its remote cache off); the build passes, the cache stays on, the
 # other entries are stored and served.
 d5() { # EXPECT_CONTINUE
     expect="$1"
     blob_mib=10
-    log "D5, ${blob_mib} MiB output over max_object_size=1MiB, useExpectContinue=$expect"
+    log "d5, ${blob_mib} MiB output over max_object_size=1MiB, useExpectContinue=$expect"
     start_cachette 18091 1MiB
     a="$(checkout "d5-$expect-a")"
     b="$(checkout "d5-$expect-b-elsewhere")"

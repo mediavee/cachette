@@ -308,7 +308,7 @@ pub(crate) struct Settings {
     /// Directory holding the cache [default: data].
     #[arg(long, env = "CACHETTE_DATA_DIR", value_name = "DIR")]
     data_dir: Option<PathBuf>,
-    /// Ceiling for stored objects and in-flight uploads, such as `26GiB`. Required.
+    /// Ceiling for stored objects and in-flight uploads, such as `20GiB`. Required.
     #[arg(long, env = "CACHETTE_MAX_SIZE", value_name = "SIZE")]
     max_size: Option<Size>,
     /// Largest accepted object [default: 512MiB, or `max_size` if smaller].

@@ -1,4 +1,4 @@
-//! `GET` and `HEAD` on a key (D4).
+//! `GET` and `HEAD` on a key.
 
 use axum::body::Body;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -12,7 +12,7 @@ use crate::key::Key;
 /// `200` with the exact `Content-Length` (opendal 0.59 fails without it), or `404`.
 ///
 /// A store failure is answered as a miss and logged: a 5xx would make Gradle drop the remote
-/// cache for the rest of the build (D5), where a miss only costs one rebuilt task.
+/// cache for the rest of the build, where a miss only costs one rebuilt task.
 pub(super) async fn get(state: &State, key: &Key) -> Handled {
     match state.store.read(key).await {
         Ok(Some(object)) => {

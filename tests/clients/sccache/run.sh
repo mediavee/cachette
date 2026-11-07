@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Real sccache (pinned v0.19.0 release binary) against a real cachette, over WebDAV (D8, D26).
+# Real sccache (pinned v0.19.0 release binary) against a real cachette, over WebDAV.
 #
 #   tests/clients/sccache/run.sh [default|no-create-dir|drop ...]    (default: all three)
 #
 # First build writes with a write token; after `cargo clean` the second build reads with a read
 # token in READ_ONLY mode and must hit remotely. `drop` runs the same two builds against a server
-# whose max_object_size splits the demo crate's objects (D5).
+# whose max_object_size splits the demo crate's objects.
 #
 # Environment:
 #   CACHETTE_BIN       the server binary (default target/release/cachette)
@@ -105,7 +105,7 @@ access_puts() {
     echo "$n"
 }
 
-# D5: the objects over max_object_size get a 413. sccache counts a missed write, the build still
+# The objects over max_object_size get a 413. sccache counts a missed write, the build still
 # succeeds, the objects under the limit are stored and the second build hits exactly those.
 # 128KiB splits the demo crate's objects (80 kB to 340 kB on aarch64-apple-darwin); the split is
 # read back from the access log instead of assumed.

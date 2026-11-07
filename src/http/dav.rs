@@ -1,4 +1,4 @@
-//! The `WebDAV` subset sccache needs (D8): `PROPFIND`, `MKCOL` and `OPTIONS`.
+//! The `WebDAV` subset sccache needs: `PROPFIND`, `MKCOL` and `OPTIONS`.
 //!
 //! Directories are virtual and always exist, so sccache's existence check succeeds and it never
 //! sends a `MKCOL`; the one it would send is a no-op.

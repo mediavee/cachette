@@ -1,8 +1,8 @@
 //! The key router: `GET`, `HEAD`, `PUT` and the `WebDAV` subset sccache needs, on `/<key>`.
 //!
-//! `server` mounts [`router`] under `/healthz` and `/metrics`, which are never keys (D10).
+//! `server` mounts [`router`] under `/healthz` and `/metrics`, which are never keys.
 //!
-//! A PUT is decided on its headers, in this order (D7): authentication, key, `Content-Length`,
+//! A PUT is decided on its headers, in this order: authentication, key, `Content-Length`,
 //! admission by the store. Only then is the body touched, so a refusal sent under
 //! `Expect: 100-continue` makes hyper skip the `100` and the client skip the body.
 
@@ -99,11 +99,11 @@ enum Target {
 /// Why a request was not served as asked, beyond its status. Shown in the access log.
 #[derive(Debug, Clone, Copy)]
 enum Note {
-    /// The PUT was not stored (D5).
+    /// The PUT was not stored.
     Dropped(DropReason),
     /// The PUT body ended early or failed; nothing was stored.
     Aborted,
-    /// Missing or invalid credentials, or a token without the right to write (D11, D38).
+    /// Missing or invalid credentials, or a token without the right to write.
     Refused,
 }
 
@@ -150,7 +150,7 @@ impl Handled {
         Self::new(response)
     }
 
-    /// A PUT that is not stored, answered with `status` (D5).
+    /// A PUT that is not stored, answered with `status`.
     fn dropped(reason: DropReason, status: StatusCode) -> Self {
         Self {
             note: Some(Note::Dropped(reason)),
@@ -337,7 +337,7 @@ enum Severity {
     Error,
 }
 
-/// Logs the request when `access_log` asks for it (D38). A dropped PUT or a server error is
+/// Logs the request when `access_log` asks for it. A dropped PUT or a server error is
 /// logged whatever the setting; refusals and client errors need `errors` or `all`. A miss is a
 /// normal answer, not an error.
 fn log_access(
