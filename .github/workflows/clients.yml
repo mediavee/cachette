@@ -41,7 +41,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - name: Roundtrip, d5 and read-token push
+      - name: Roundtrip, refused and read-token push
         run: tests/clients/gradle/run.sh
       # The check must go red on a cache that holds nothing, or a pass proves nothing.
       - name: Control, empty server must fail

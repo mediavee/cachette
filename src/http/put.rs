@@ -81,7 +81,7 @@ async fn abandon(
 /// its status.
 fn not_stored(parts: &Parts, reason: DropReason) -> Handled {
     // Despite its docs, Gradle's `HttpBuildCache` turns the remote cache off for the rest of the
-    // build on any non-2xx status of a PUT, so it gets 200; the `d5` scenario of
+    // build on any non-2xx status of a PUT, so it gets 200; the `refused` scenario of
     // `tests/clients/gradle/run.sh` fails when Gradle gets 413.
     let status = if is_gradle_artifact(&parts.headers) {
         StatusCode::OK
