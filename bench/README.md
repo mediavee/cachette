@@ -1,6 +1,7 @@
 # Reproducible HTTP cache benchmark
 
-`run.py` is the single entry point. It uses Python's standard library and Docker on
+`run.py` is the loopback benchmark; [`gradle.py`](#a-real-gradle-build-over-a-real-network) is the real-network
+Gradle build. `run.py` uses Python's standard library and Docker on
 a Linux x86_64 host, for the servers and the loopback client. No Python
 packages are needed. The [final run](results/2026-11-06T204503Z-linux-x86_64-16t.md)
 measures cachette's real store and HTTP path; the comparison in the top-level README
@@ -167,12 +168,17 @@ causes. Replay on a quiet host for 30 seconds before drawing a conclusion.
 Loopback shares client/server CPU and memory. Page cache is hot; no cold-disk
 or remote-network claim follows. A successful PUT is not proof of retention
 (a cachette under its ceiling drops uploads it cannot store; the reports record
-the statuses it answered). True Gradle/sccache build
-results come from the `clients` workflow, not from this benchmark.
+the statuses it answered). Real Gradle builds are
+`gradle.py`'s; the `clients` workflow checks the protocol with real Gradle and sccache.
 
 ## Recorded runs
 
-The successful reports retain their original source/configuration and
+- [A real Gradle build over a VPN, five repetitions](results/2026-11-07T021448Z-gradle-darwin-arm64-10t.md):
+  `gradle.py` on a private 13-project build, with cachette 0.1.0 built from `main` at `a55ffd3` on a
+  Linux host. The top-level README quotes it; `python3 -B bench/gradle.py --summary <report>` prints
+  each figure it quotes from the report's raw data.
+
+The loopback reports made by `run.py` retain their original source/configuration and
 measurements, with raw evidence consolidated into each Markdown file:
 
 - [Final run, 4 GiB, 10 s, two runs per point](results/2026-11-06T204503Z-linux-x86_64-16t.md):

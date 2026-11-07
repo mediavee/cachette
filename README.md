@@ -270,12 +270,49 @@ and p99: [Throughput and latency, lines 75 to 322](bench/results/2026-11-06T2045
 | **Gradle round trip** | **Proven**: a build with a `write` token fills the cache, a build from another directory with a `read` token serves every cacheable task `FROM-CACHE`. Gradle 9.8.1 and the latest 8.x, Linux and macOS. | [`tests/clients/gradle/run.sh`](tests/clients/gradle/run.sh), [`clients` run on `main`](https://github.com/mediavee/cachette/actions/runs/42291630374) |
 | **Gate** | `cargo fmt`, `clippy -D warnings`, `cargo test` and `cargo deny` pass on Linux and macOS, plus a build on the declared Rust version and the tests on musl. | [`CI` run on `main`](https://github.com/mediavee/cachette/actions/runs/42291630227), [`ci.yml`](.github/workflows/ci.yml) |
 
+### A real build over a real network
+
+The loopback numbers above say nothing about a build. [`bench/gradle.py`](bench/gradle.py) runs
+the build a CI runs, `build`, on a private multi-module Gradle project (13 Gradle projects: the
+root and 12 modules; 212 tasks per build), with this machine as the client and cachette on a Linux
+host reached through a VPN between the two machines. Gradle's local cache was off and the daemon
+too, as on a fresh runner. Every build was a clean build of a fresh copy. Five repetitions of a
+baseline (no remote cache) and a hit (read token, another directory), after one fill build
+(write token) against an empty server. [Full report and raw data](bench/results/2026-11-07T021448Z-gradle-darwin-arm64-10t.md).
+
+| | Result |
+|---|---|
+| Round trip | `GET /healthz`, 300 requests on one kept-alive connection: median 10.8 ms, p99 14.1 ms before the builds and 11.6 ms after. |
+| Cacheable tasks | 54 per build: the fill stored 54 entries (67.7 MiB), and each hit build asked the server 54 times. |
+| Hit rate | **44 of 54 cacheable tasks (81.5 %) came `FROM-CACHE`**, in every one of the five hit builds. Counted over every task that ran or came from the cache, as the script defines it, it is 44 of 167 (26.3 %): the 113 others never asked the server (by their names, lifecycle tasks such as `build` and `check`, and `jar`). A hit build read 60.4 MiB. |
+| Baseline | median 177.7 s, from 157.9 s to 369.6 s (standard deviation 87.4 s). |
+| Hit | median 167.1 s, from 142.9 s to 177.7 s (standard deviation 13.7 s). |
+| Time saved | **10.6 s (6 %) at the median**. By repetition: −11.7, +75.4, +192.0, +34.8 and +3.5 s. |
+
+What to take from it: the cache served four tasks in five that it could, but **on this project the
+time saved is inside the noise**. The 10 lookups that missed every time are most likely the `test`
+tasks of nine modules and one `shadowJar`, the executed tasks of kinds that other modules got from
+the cache; the report does not name them per lookup. Why they missed was not investigated (a
+guess: an input that holds the project path). The largest
+saving, 192 s, is the repetition where the baseline took 369.6 s with this machine at load 15
+(its one-minute load before the builds ranged from 6.1 to 21.4, the server host's from 0.01 to
+0.66), so it measures the load as much as the cache. Where the remaining 167 s go was not profiled.
+
+What this run does not show:
+
+- **One project, one client, one network path**, five repetitions, on a shared machine. It is not
+  a statement about builds in general, nor about the VPN: the round trip is the one measured here.
+- **Whether the misses are the project's or the cache's.** The same keys were not compared across
+  the two directories. A CI that builds from the same path each time may hit more.
+- **The cost of transfers alone.** Nothing times the 60 MiB read apart from the build.
+- **Pushes under load, a full disk, eviction, TLS, Maven or Bazel.** The cache stayed at 1.7 % of
+  its 4 GiB cap.
+- **Other numbers of this README.** The loopback comparison keeps its own limits, listed above.
+
 ### What this does not show
 
-- **The real network.** Everything above is loopback. A run from another machine was not made.
-  Over a real network with a round trip of milliseconds, per-request costs of microseconds matter less.
 - **Real builds at scale.** The Gradle project in CI is small (Java 17, JUnit 5, four cacheable
-  tasks). No result on a large project is published.
+  tasks); the real build above is one project and shows no saving. No other result is published.
 - **PUT rankings at 1 MiB and above**, as said above.
 - **Startup time with many entries**, memory with many entries, TLS throughput, macOS throughput.
 - **Maven and Bazel**, which are untested.

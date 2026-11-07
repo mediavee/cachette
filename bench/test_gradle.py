@@ -253,6 +253,28 @@ class ReportTests(unittest.TestCase):
         raw = json.loads(text.split("```json\n")[1].split("\n```")[0])
         self.assertEqual(raw["summary"]["saved_seconds"], 60.0)
 
+    def test_the_readme_figures_are_recomputed_from_the_raw_data_of_a_report(self):
+        data = self.data()
+        counters = lambda hits, misses, entries, written, read: {
+            "cachette_hits_total": hits, "cachette_misses_total": misses, "cachette_entries": entries,
+            "cachette_written_bytes_total": written, "cachette_read_bytes_total": read}
+        zero = counters(0, 0, 0, 0, 0)
+        fill = self.build("fill", None, 9.0, {":a:compileJava": "EXECUTED"})
+        fill.update(metrics_before=zero, metrics_after=counters(0, 3, 3, 300, 0))
+        data["builds"].insert(0, fill)
+        for build in data["builds"][1:]:
+            build.update(metrics_before=counters(0, 3, 3, 300, 0), metrics_after=counters(0, 3, 3, 300, 0))
+        data["builds"][2].update(metrics_after=counters(1, 4, 3, 300, 70))
+        with tempfile.TemporaryDirectory() as directory:
+            scrubber = gradle.Scrubber(Path(directory) / "secretproject")
+            figures = gradle.figures(gradle.raw_data(self.render(data, scrubber)))
+        self.assertEqual((figures["lookups_per_hit_build"], figures["server_hits_per_hit_build"]), (2, 1))
+        self.assertEqual(figures["hit_rate_of_lookups"], 0.5)
+        self.assertEqual((figures["entries_stored_by_fill"], figures["bytes_stored_by_fill"]), (3, 300))
+        self.assertEqual(figures["bytes_read_per_hit_build"], 70)
+        self.assertEqual((figures["tasks_per_build"], figures["projects_with_tasks"]), (3, 2))
+        self.assertEqual(figures["saved_seconds"], 60.0)
+
     def test_a_name_that_survives_scrubbing_stops_the_write(self):
         with tempfile.TemporaryDirectory() as directory:
             scrubber = gradle.Scrubber(Path(directory) / "secretproject")

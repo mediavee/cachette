@@ -340,6 +340,50 @@ def summarize(builds):
                       for rep, b, h in pairs]}
 
 
+def raw_data(report_text):
+    """The raw data block of a report written by `render`."""
+    return json.loads(report_text.split("```json\n")[1].split("\n```")[0])
+
+
+def delta(build, name):
+    return build["metrics_after"][name] - build["metrics_before"][name]
+
+
+def figures(data):
+    """The numbers the README quotes, recomputed from a report's raw data.
+
+    A lookup is a request that reached the cache: a Gradle task that is cacheable and not
+    up to date asks the server once, so the server's hits plus misses count the cacheable tasks.
+    """
+    builds = {kind: [b for b in data["builds"] if b["kind"] == kind] for kind in ("fill", "baseline", "hit")}
+    hits = builds["hit"]
+    summary = summarize(data["builds"])
+    rtt = data["round_trip"]
+    loads = [b["client_load_before"][0] for b in data["builds"]]
+    server_loads = [b["server_load_before"] for b in data["builds"] if b["server_load_before"] is not None]
+    lookups = [delta(b, "cachette_hits_total") + delta(b, "cachette_misses_total") for b in hits]
+    from_cache = [delta(b, "cachette_hits_total") for b in hits]
+    return {
+        "projects_with_tasks": len({task.partition(":")[0] for task in hits[0]["outcomes"]}),
+        "tasks_per_build": statistics.median(len(b["outcomes"]) for b in hits),
+        "from_cache_per_hit_build": statistics.median(b["counts"]["FROM-CACHE"] for b in hits),
+        "hit_rate_ran_or_cached": summary["hit_rate"],
+        "lookups_per_hit_build": statistics.median(lookups),
+        "server_hits_per_hit_build": statistics.median(from_cache),
+        "hit_rate_of_lookups": statistics.median(h / n for h, n in zip(from_cache, lookups)),
+        "entries_stored_by_fill": delta(builds["fill"][0], "cachette_entries"),
+        "bytes_stored_by_fill": delta(builds["fill"][0], "cachette_written_bytes_total"),
+        "bytes_read_per_hit_build": statistics.median(delta(b, "cachette_read_bytes_total") for b in hits),
+        "baseline_seconds": summary["baseline"], "hit_seconds": summary["hit"],
+        "saved_seconds": summary["saved_seconds"], "saved_percent": summary["saved_percent"],
+        "paired_saved_seconds": [pair["saved_seconds"] for pair in summary["pairs"]],
+        "round_trip_ms": {name: {k: rtt[name][k] for k in ("median_ms", "p99_ms")} for name in ("before", "after")},
+        "client_load_before_builds": [min(loads), max(loads)],
+        "server_load_before_builds": [min(server_loads), max(server_loads)] if server_loads else None,
+        "builds": {"baseline": len(builds["baseline"]), "hit": len(hits)},
+    }
+
+
 def minutes(seconds):
     return f"{seconds:.1f} s"
 
@@ -435,9 +479,11 @@ def versions(gradle, workspace, env, timeout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--project", type=Path, required=True, help="the Gradle project directory")
-    parser.add_argument("--url", required=True, help="the cache server's base URL, e.g. http://host:5071")
-    parser.add_argument("--tasks", required=True, help='the Gradle tasks, one string, e.g. "build -x test"')
+    parser.add_argument("--summary", type=Path, metavar="REPORT",
+                        help="print the figures a README quotes from a report, and exit")
+    parser.add_argument("--project", type=Path, help="the Gradle project directory")
+    parser.add_argument("--url", help="the cache server's base URL, e.g. http://host:5071")
+    parser.add_argument("--tasks", help='the Gradle tasks, one string, e.g. "build -x test"')
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--gradle-arg", action="append", default=[], help="an extra Gradle argument for every build")
     parser.add_argument("--exclude", action="append", default=["build", ".gradle", ".kotlin"],
@@ -452,8 +498,12 @@ def main():
     parser.add_argument("--work-dir", type=Path, default=Path(tempfile.gettempdir()))
     parser.add_argument("--results", type=Path, default=Path(__file__).resolve().parent / "results")
     args = parser.parse_args()
-    if args.repetitions < 1 or not args.project.is_dir() or not shlex.split(args.tasks):
-        parser.error("repetitions >= 1, an existing project directory and tasks are required")
+    if args.summary:
+        print(json.dumps(figures(raw_data(args.summary.read_text())), indent=2))
+        return
+    if args.repetitions < 1 or not args.url or not args.project or not args.project.is_dir() \
+            or not args.tasks or not shlex.split(args.tasks):
+        parser.error("--project (an existing directory), --url, --tasks and repetitions >= 1 are required")
     tokens = {name: os.environ.get(name) for name in ("BENCH_WRITE_TOKEN", "BENCH_READ_TOKEN")}
     if not all(tokens.values()):
         parser.error("BENCH_WRITE_TOKEN and BENCH_READ_TOKEN must be set in the environment")
