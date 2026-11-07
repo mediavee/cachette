@@ -1,22 +1,22 @@
-# cachette configuration, as deployed for the Mediavee build cache.
+# cachette configuration: an annotated example.
 #
 # Every setting has a line here, with the reason for its value. Lines starting with `# key =` show
 # the built-in default: uncomment one only to change it. An unknown key stops the server at start,
 # so a typo cannot go unnoticed.
 #
 # Precedence, lowest first: built-in default, this file, `CACHETTE_<KEY>` environment variable,
-# command-line flag (`cachette --help` lists them). Sizes read "26GiB", durations "30s" or "5m".
+# command-line flag (`cachette --help` lists them). Sizes read "20GiB", durations "30s" or "5m".
 
 # --- Where it listens ---------------------------------------------------------------------------
 
-# 127.0.0.1:5071 by default, the port the old Develocity Build Cache Node used, so clients keep
-# their URL. The host is reached over Tailscale, which is the access boundary here (no TLS), so the
-# server listens on every address; on a host with a public interface, name the Tailscale address
-# instead. Port 0 picks a free port, which is for tests.
+# 127.0.0.1:5071 by default, the port the Develocity Build Cache Node uses, so clients of that node
+# keep their URL. Here the server listens on every address, which exposes it to the whole network:
+# keep it behind a VPN, a private network or a firewall, or serve HTTPS (below). On a host with a
+# public interface, name the private address instead. Port 0 picks a free port, which is for tests.
 listen = "0.0.0.0:5071"
 
-# HTTPS needs both, as PEM files; set neither for plain HTTP. Tailscale already encrypts the path,
-# so the deployment runs without. Under systemd, pass the files with LoadCredential (see the unit).
+# HTTPS needs both, as PEM files; set neither for plain HTTP, which sends the tokens in clear text:
+# fine only where the path is already encrypted, such as a VPN. Under systemd, pass the files with LoadCredential (see the unit).
 # tls_cert = "/etc/cachette/tls.pem"
 # tls_key = "/etc/cachette/tls.key"
 
@@ -29,10 +29,11 @@ data_dir = "/var/lib/cachette"
 
 # Mandatory: there is no unlimited cache. The ceiling covers stored objects, uploads in flight and
 # evicted objects not yet deleted, each rounded up to 4 KiB, so the disk use never goes above it.
-# The VM has about 30 GB: 26 GiB leaves room for the system and for `min_free_disk`. To size it,
-# watch `cachette_oldest_entry_age_seconds`: an oldest entry only hours old means the cache is too
-# small for the builds it serves.
-max_size = "26GiB"
+# Keep it well under the disk, which must also hold the system, the logs and `min_free_disk`: 20 GiB
+# is an example, not a recommendation. To size it for your builds, watch
+# `cachette_oldest_entry_age_seconds`: an oldest entry only hours old means the cache is too small
+# for the builds it serves.
+max_size = "20GiB"
 
 # Largest object accepted. A bigger PUT is not stored and answers 413, or 200 to Gradle, which
 # turns its remote cache off for the rest of the build on any other status. Never above `max_size`.
@@ -81,7 +82,7 @@ max_size = "26GiB"
 # access_log = "errors"
 
 # Async worker threads; the blocking pool is left at tokio's default. The default, one per core, is
-# right unless the VM shares its cores with something else.
+# right unless the host shares its cores with something else.
 # worker_threads = 4
 
 # --- Who may use it -----------------------------------------------------------------------------
@@ -90,7 +91,7 @@ max_size = "26GiB"
 # closed here: every client, CI and developers alike, carries a token.
 # anonymous = "none"
 
-# A token on /metrics. Unset, it is open, which is fine on a tailnet; set it when Prometheus
+# A token on /metrics. Unset, it is open, which is fine on a private network; set it when Prometheus
 # scrapes across a boundary. Prefer CACHETTE_METRICS_TOKEN in the environment file.
 # metrics_token = "..."
 

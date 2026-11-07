@@ -24,7 +24,7 @@ Only one setting is required: `max_size`. And at least one token, unless `anonym
 
 ## Sizes and durations
 
-Sizes read `26GiB`, `512MiB`, `16KiB`, `1.5GiB`, or a plain number of bytes. Suffixes are not case
+Sizes read `20GiB`, `512MiB`, `16KiB`, `1.5GiB`, or a plain number of bytes. Suffixes are not case
 sensitive. `KiB`, `MiB` and `GiB` are powers of 1024. `KB`, `MB`, `GB` (and `K`, `M`, `G`) are
 powers of 1000: `1GB` is 1 000 000 000 bytes. Use the binary suffixes: that is what the examples and
 the limits below mean.

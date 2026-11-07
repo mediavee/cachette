@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Real Gradle against a real cachette (D26): relocation, D5 and the read-token push.
+# Real Gradle against a real cachette: relocation, a refused object and the read-token push.
 #
-#   tests/clients/gradle/run.sh [roundtrip|d5|read-push ...]    (default: all three)
+#   tests/clients/gradle/run.sh [roundtrip|refused|read-push ...]    (default: all three)
 #
 # Environment:
 #   CACHETTE_BIN       the server binary (default target/release/cachette)
 #   GRADLE_VERSION     "9.8.1", or "8" for the latest 8.x; default: the gradle on PATH
 #   CLIENTS_SKIP_WARMUP=1   skips the build that fills the cache: every check on hits must then
 #                      fail, which proves the script goes red on an empty server
-# Ports 18090 (roundtrip, read-push) and 18091 (d5), from the chantier port table.
+# Ports 18090 (roundtrip, read-push) and 18091 (refused).
 set -euo pipefail
 
 CLIENTS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -89,21 +89,21 @@ roundtrip() { # EXPECT_CONTINUE
     assert_ge "server hits" "$(metric cachette_hits_total)" 4
 }
 
-# D5: an output larger than max_object_size and than any socket buffer is dropped, and Gradle gets
+# refused: an output larger than max_object_size and than any socket buffer is dropped, and Gradle gets
 # a 200 (any other status turns its remote cache off); the build passes, the cache stays on, the
 # other entries are stored and served.
-d5() { # EXPECT_CONTINUE
+refused() { # EXPECT_CONTINUE
     expect="$1"
     blob_mib=10
-    log "D5, ${blob_mib} MiB output over max_object_size=1MiB, useExpectContinue=$expect"
+    log "refused, ${blob_mib} MiB output over max_object_size=1MiB, useExpectContinue=$expect"
     start_cachette 18091 1MiB
-    a="$(checkout "d5-$expect-a")"
-    b="$(checkout "d5-$expect-b-elsewhere")"
+    a="$(checkout "refused-$expect-a")"
+    b="$(checkout "refused-$expect-b-elsewhere")"
     tasks="build generateReport generateBlob -PblobMiB=$blob_mib"
     # shellcheck disable=SC2086
-    build "$a" "$WRITE_TOKEN" true "$expect" "$WORK/d5-$expect-1.log" $tasks
-    assert_cache_stayed_on "$WORK/d5-$expect-1.log"
-    [ "$(task_state "$WORK/d5-$expect-1.log" generateBlob)" = "EXECUTED" ] || fail "generateBlob did not run"
+    build "$a" "$WRITE_TOKEN" true "$expect" "$WORK/refused-$expect-1.log" $tasks
+    assert_cache_stayed_on "$WORK/refused-$expect-1.log"
+    [ "$(task_state "$WORK/refused-$expect-1.log" generateBlob)" = "EXECUTED" ] || fail "generateBlob did not run"
     [ -s "$a/build/blob/random.bin" ] || fail "no blob output"
     size="$(wc -c <"$a/build/blob/random.bin" | tr -d ' ')"
     [ "$size" -ge $((8 * 1024 * 1024)) ] || fail "blob is only $size bytes"
@@ -113,10 +113,10 @@ d5() { # EXPECT_CONTINUE
     # The next build: small entries come from the cache, the blob was never stored so it runs
     # again and its PUT is dropped again, still without a warning.
     # shellcheck disable=SC2086
-    build "$b" "$WRITE_TOKEN" true "$expect" "$WORK/d5-$expect-2.log" $tasks
-    assert_cache_stayed_on "$WORK/d5-$expect-2.log"
-    assert_all_from_cache "$WORK/d5-$expect-2.log"
-    [ "$(task_state "$WORK/d5-$expect-2.log" generateBlob)" = "EXECUTED" ] || fail "generateBlob should run again"
+    build "$b" "$WRITE_TOKEN" true "$expect" "$WORK/refused-$expect-2.log" $tasks
+    assert_cache_stayed_on "$WORK/refused-$expect-2.log"
+    assert_all_from_cache "$WORK/refused-$expect-2.log"
+    [ "$(task_state "$WORK/refused-$expect-2.log" generateBlob)" = "EXECUTED" ] || fail "generateBlob should run again"
     assert_ge "dropped PUTs after two builds" "$(metric cachette_puts_dropped_total 'reason="too_large"')" 2
 }
 
@@ -137,11 +137,11 @@ read_push() {
     assert_ge "refused writes (403) on the server" "$(metric cachette_requests_total 'status="403"')" 1
 }
 
-scenarios="${*:-roundtrip d5 read-push}"
+scenarios="${*:-roundtrip refused read-push}"
 for scenario in $scenarios; do
     case "$scenario" in
         roundtrip) roundtrip false; roundtrip true ;;
-        d5) d5 false; d5 true ;;
+        refused) refused false; refused true ;;
         read-push) read_push ;;
         *) fail "unknown scenario $scenario" ;;
     esac

@@ -10,7 +10,7 @@
 [Unit]
 Description=cachette remote build cache (Gradle, sccache)
 Documentation=https://github.com/mediavee/cachette
-# When `listen` names one interface's address (a Tailscale one, say), also order this unit after
+# When `listen` names one interface's address (a VPN's, say), also order this unit after
 # the service that brings that interface up.
 After=network.target
 

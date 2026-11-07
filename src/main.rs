@@ -22,7 +22,7 @@ use metrics::Metrics;
 use server::Server;
 use store::{Options, Store};
 
-/// musl's allocator is 29 to 200 times slower under contention (D39).
+/// musl's allocator is 29 to 200 times slower under contention.
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -103,7 +103,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     server
         .serve(server::app(&config, store.clone(), metrics), stamped)
         .await;
-    // D32: a missed shutdown deadline forbids `clean = true`. The state written at open
+    // A missed shutdown deadline forbids `clean = true`. The state written at open
     // already says not clean; skipping or abandoning `close` keeps it that way.
     let remaining = remaining_before_deadline(
         *shutdown_at.lock().expect("shutdown stamp poisoned"),

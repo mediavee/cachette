@@ -1,5 +1,5 @@
-//! Black-box tests of the Gradle protocol, authentication and `Expect: 100-continue` (D4 to D7,
-//! D11), against the real binary.
+//! Black-box tests of the Gradle protocol, authentication and `Expect: 100-continue`, against the
+//! real binary.
 
 mod common;
 

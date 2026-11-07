@@ -151,7 +151,7 @@ Gradle's own integration test, `HttpBuildCacheServiceTest`, expects that excepti
 
 So for Gradle, `200` is the only way to refuse an object and leave the cache on. The price is that
 the client believes the object is stored: the next build rebuilds it, and the metric says why. The
-real Gradle 9.8.2 confirms it: with a `413`, the `d5` scenario of
+real Gradle 9.8.2 confirms it: with a `413`, the `refused` scenario of
 [`tests/clients/gradle/run.sh`](../tests/clients/gradle/run.sh) fails with "The remote build cache
 was disabled during the build due to errors."
 
@@ -180,7 +180,7 @@ Gradle `Content-Type`, is checked by `a_put_the_header_decision_drops_answers_41
 `a_put_that_fails_after_admission_answers_413_and_gradle_gets_200` and
 `every_drop_reason_answers_413_except_to_gradle` (which covers `not_ready` too).
 
-The real Gradle shows the same in the `d5` scenario of the
+The real Gradle shows the same in the `refused` scenario of the
 [`clients` workflow](../.github/workflows/clients.yml): an output of 10 MiB over a
 `max_object_size` of 1 MiB, with and without `useExpectContinue`. The server answers `200` to
 Gradle's `PUT`, the build passes, Gradle prints no

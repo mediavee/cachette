@@ -1,12 +1,12 @@
 # Real clients against the real binary
 
-Each script starts its own throwaway `cachette` (random tokens, temporary data directory, ports
-from the chantier table) and drives the genuine client. Nothing is installed globally.
+Each script starts its own throwaway `cachette` (random tokens, temporary data directory, fixed
+local ports) and drives the genuine client. Nothing is installed globally.
 
 | Script | What it proves |
 |---|---|
 | `gradle/run.sh roundtrip` | A build with a `write` token fills the cache; after the project is copied elsewhere, a build with a `read` token serves every cacheable task `FROM-CACHE`. With and without `useExpectContinue`. |
-| `gradle/run.sh d5` | An output of 10 MiB (more than any socket buffer) over `max_object_size = 1MiB` is dropped with a 200, the status Gradle needs (a 413 disables its remote cache): the build passes, no remote-cache warning, the other entries are stored and served at the next build. With and without `useExpectContinue`. |
+| `gradle/run.sh refused` | An output of 10 MiB (more than any socket buffer) over `max_object_size = 1MiB` is dropped with a 200, the status Gradle needs (a 413 disables its remote cache): the build passes, no remote-cache warning, the other entries are stored and served at the next build. With and without `useExpectContinue`. |
 | `gradle/run.sh read-push` | A `read` token with `push = true`: reads work, the first store gets a 403, Gradle warns and turns the remote cache off for the rest of that build, and the build succeeds. |
 | `sccache/run.sh` | sccache 0.19.0 (pinned release binary, checksum checked) over WebDAV with `SCCACHE_WEBDAV_TOKEN`: build, `cargo clean`, second build reads with a `read` token in `READ_ONLY` mode and reports remote hits. Second variant with `SCCACHE_WEBDAV_DISABLE_CREATE_DIR=true`, which must send no `PROPFIND` and no `MKCOL`. `sccache/run.sh drop`: `max_object_size` splits the demo crate's objects, the oversized ones get a 413 (counted by sccache as failed writes), the build succeeds, the others are stored and the second build hits them. |
 | `gradle-external.sh <checkout>` | Applies the cache to any Gradle project through an init script, without modifying it. Prints the `FROM-CACHE` count of the second build. |

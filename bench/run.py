@@ -143,26 +143,13 @@ def main():
     parser.add_argument("--work-dir", type=Path, help="Defaults to ~/cachette-bench on the host that runs it")
     parser.add_argument("--results", type=Path, default=HERE / "results")
     parser.add_argument("--preflight-only", action="store_true")
-    parser.add_argument("--remote", help="Run the client here and servers over SSH on this Tailscale host")
-    parser.add_argument("--remote-root", default="~/cachette-bench/repo",
-                        help="Checkout path on the remote host, with --remote; ~/ is its home")
-    parser.add_argument("--oha", type=Path, help="Native oha 1.14.0 binary for the Tailscale client")
-    parser.add_argument("--tailscale-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.seconds < 1 or args.cap_mib < 64 or args.max_load < 0:
         parser.error("seconds >= 1, cap-mib >= 64 and max-load >= 0 required")
     if "bazel" in args.servers and (args.cap_mib < 1024 or args.cap_mib % 1024):
         parser.error("bazel requires cap-mib to be a positive multiple of 1024 (whole GiB)")
-    if args.remote:
-        from network import coordinate
-        return coordinate(args)
     if args.work_dir is None:
         args.work_dir = Path.home() / "cachette-bench"
-    global LISTEN
-    if args.tailscale_worker:
-        from network import rpc
-        LISTEN = command("tailscale", "ip", "-4").splitlines()[0]
-        sys.stdout = sys.stderr
     preflight(args.max_load)
     if args.preflight_only:
         print("Preflight passed: load low, all four ports free")
@@ -191,10 +178,8 @@ def main():
         "foster": "31e69559cde78277192281173176a9e25d13a3bb",
         "bazel": BAZEL_IMAGE, "bazel_storage_mode": "uncompressed",
     }
-    metadata["path"] = "Tailscale" if args.tailscale_worker else "loopback"
+    metadata["path"] = "loopback"
     metadata["listen"] = LISTEN
-    if args.tailscale_worker:
-        metadata["client"] = rpc(action="context")
     rows, pressure, versions, probes = [], [], {}, []
     containers = []
     pressure_monitor = None
@@ -207,7 +192,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     failure = None
     try:
-        for target in ([] if args.tailscale_worker else ["oha"]) + args.servers:
+        for target in ["oha"] + args.servers:
             if target == "bazel":
                 command("docker", "pull", BAZEL_IMAGE)
                 command("docker", "tag", BAZEL_IMAGE, "cachette-bench-bazel")
@@ -270,7 +255,7 @@ def main():
                 probes.append(f"nginx PROPFIND /: {status}")
                 if status != 207:
                     raise RuntimeError("nginx dav-ext probe failed")
-            for size in ([4096, 1048576] if args.tailscale_worker else SIZES):
+            for size in SIZES:
                 payload = os.urandom(size)
                 body = run_dir / "body"
                 body.write_bytes(payload)
@@ -282,7 +267,7 @@ def main():
                     raise RuntimeError(f"{server}: seed readback failed")
                 probes.append(f"{server} {size} bytes: PUT and full GET SHA-256 match")
                 for method in ["GET", "PUT"]:
-                    for concurrency in ([1, 16] if args.tailscale_worker else [1, 16, 64]):
+                    for concurrency in [1, 16, 64]:
                         for repeat in [1, 2]:
                             peak = [0]
                             stop = threading.Event()
@@ -308,36 +293,17 @@ def main():
                                 oha += ["-D", "/input/body"]
                             try:
                                 url = f"http://{LISTEN}:{PORTS[server]}/{key}"
-                                client = None
-                                if args.tailscale_worker:
-                                    from network import cpu_ticks, cpu_busy
-                                    prepared = rpc(action="prepare", url=url, method=method,
-                                                   body=base64.b64encode(payload).decode() if method == "PUT" else None,
-                                                   concurrency=concurrency, seconds=args.seconds)
-                                    cpu_start = cpu_ticks()
-                                    client = rpc(action="measure")
-                                    server_cpu = cpu_busy(cpu_start, cpu_ticks())
-                                    client.update(prepared)
-                                    client.update(rpc(action="finish"))
-                                    result = client.pop("oha")
-                                else:
-                                    result = json.loads(command(*oha, url))
+                                result = json.loads(command(*oha, url))
                             finally:
                                 stop.set()
                                 if monitor:
                                     monitor.join()
                             if sample_errors:
                                 raise RuntimeError("RSS sampling failed") from sample_errors[0]
-                            rows.append(dict(server=server, durability=durability, client=client,
-                                             server_cpu_busy=server_cpu if args.tailscale_worker else None,
+                            rows.append(dict(server=server, durability=durability,
                                              size=size, method=method, concurrency=concurrency,
                                              repeat=repeat, peak_rss_kib=peak[0], load=os.getloadavg(), oha=result))
                             print(f"  {method} {size} c={concurrency} run={repeat}: {statistics(result)}", flush=True)
-            if args.tailscale_worker:
-                command("docker", "rm", "-f", name)
-                containers.remove(name)
-                shutil.rmtree(data)
-                continue
             # A fresh directory isolates eviction from throughput's repeated overwrites.
             command("docker", "rm", "-f", name)
             containers.remove(name)
@@ -389,8 +355,6 @@ def main():
         if failure:
             report = run_dir.parent / f"failed-{stamp}.md"
         render(report, metadata, versions, probes, rows, pressure, failure)
-        if args.tailscale_worker and not failure:
-            rpc(action="report", name=report.name, text=report.read_text())
         print(report, flush=True)
 
 
@@ -428,17 +392,6 @@ def render(path, metadata, versions, probes, rows, pressure, failure):
               "cachette is unmeasured unless explicitly present above; no comparative claim about it follows.", "",
               "Final replay from the repository root:", "", "```sh",
               replay_command(), "```", ""]
-    if metadata.get("path") == "Tailscale":
-        lines += ["", "## Tailscale and host CPU", "",
-                  "CPU is whole-host busy percentage over each request interval, including other workloads and Tailscale; not process attribution.",
-                  "RTT and direct/DERP evidence are the tailscale ping output before and after each cell in raw evidence.", "",
-                  "| Server | Durability | Method | Bytes | c | Run | Client CPU % | Server CPU % | RTT min/max ms (before/after) | Route (before/after) | Client load 1/5/15 |",
-                  "|---|---|---|---:|---:|---:|---:|---:|---|---|---|"]
-        for row in rows:
-            client = row["client"]
-            samples = client["ping_before"]["rtt_ms"] + client["ping_after"]["rtt_ms"]
-            states = sorted(set(client["ping_before"]["states"] + client["ping_after"]["states"]))
-            lines.append(f"| {row['server']} | {row['durability']} | {row['method']} | {row['size']} | {row['concurrency']} | {row['repeat']} | {client['cpu_busy']:.2f} | {row['server_cpu_busy']:.2f} | {min(samples):.2f}/{max(samples):.2f} | {', '.join(states)} | {client['load']} |")
     evidence = dict(metadata=metadata, versions=versions, probes=probes, rows=rows, pressure=pressure, failure=failure)
     lines += ["", "<details><summary>Raw evidence</summary>", "", "```json",
               json.dumps(evidence, indent=2), "```", "", "</details>", ""]

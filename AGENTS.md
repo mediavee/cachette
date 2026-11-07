@@ -1,7 +1,7 @@
 # cachette
 
 Remote build cache server (Gradle `HttpBuildCache`, sccache WebDAV). A single binary crate, Rust
-edition 2024. The design decisions are numbered D1 to D29 in the chantier spec.
+edition 2024.
 
 ## Gate
 
@@ -35,7 +35,7 @@ binaries ship with and runs the smoke tests against it.
   sink.
 - Never a fully qualified name inline: import it. Comments say why, not what.
 - Every PUT the server does not store answers 413, or 200 to Gradle's `HttpBuildCache`, and reads
-  the body to its end unless `Expect: 100-continue` lets it answer first (D5, D7).
+  the body to its end unless `Expect: 100-continue` lets it answer first.
 
 ## Tests
 
@@ -52,6 +52,6 @@ binaries ship with and runs the smoke tests against it.
 | `src/config.rs` | Settings: defaults < TOML file < `CACHETTE_*` < flags; validation. |
 | `src/server.rs` | Listener (TCP/TLS), connection limits, `/healthz`, `/metrics`, shutdown. |
 | `src/http/` | Key routes (`GET`/`HEAD`/`PUT`, WebDAV), authentication, access log. |
-| `src/store/` | Disk store. `mod.rs` is the frozen API `http` calls (D29). |
+| `src/store/` | Disk store. `mod.rs` is the API `http` calls: change a signature together with its callers. |
 | `src/key.rs` | The `Key` type: normalisation, refusals, on-disk path. |
 | `src/metrics.rs` | Every metric name, and the functions that record them. |

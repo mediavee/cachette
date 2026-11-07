@@ -1,12 +1,11 @@
-//! The disk store: what `http` calls, and a naive implementation behind it.
+//! The disk store: what `http` calls.
 //!
-//! # The contract (frozen: a signature change goes through the lead)
+//! # The contract
 //!
 //! `http` calls [`Store::read`], [`Store::stat`] and [`Store::admit`], then
-//! [`Reservation::write`]. The `store` lot replaces the implementation without changing any
-//! signature in this file. What any implementation must guarantee:
+//! [`Reservation::write`]. What the store guarantees:
 //!
-//! * **Bounded size (D12).** Live bytes (stored objects + reservations in flight) plus bytes
+//! * **Bounded size.** Live bytes (stored objects + reservations in flight) plus bytes
 //!   evicted but not yet deleted never exceed `max_size`, at any instant. One POSIX exception:
 //!   a file evicted or replaced while a GET reads it keeps its blocks until that read ends, a
 //!   transient excess bounded by the reads in flight (bazel-remote behaves the same). Sizes are charged
@@ -22,10 +21,10 @@
 //!   its charge and is retried with backoff; only a successful unlink, an `ENOENT`, or a
 //!   superseding version releases it (same rule for temporary files). A closing store stops
 //!   retrying, so [`Store::close`] never waits on a refusal; the file is left for the next start.
-//! * **Pinned keys (D12).** A key is not evictable from its reservation until it is stored or the
+//! * **Pinned keys.** A key is not evictable from its reservation until it is stored or the
 //!   reservation is dropped. An eviction decided before an object was stored never deletes it: a
 //!   deletion still pending carries a generation, so it cannot remove a newer version.
-//! * **Atomic writes (D13).** The body goes to `objects/<2 hex>/.tmp-<unique>`, in the shard
+//! * **Atomic writes.** The body goes to `objects/<2 hex>/.tmp-<unique>`, in the shard
 //!   directory of its destination, then is renamed to the object path: a rename within one
 //!   directory takes no file-system-wide lock, while one between two directories serialises
 //!   every PUT. The `.tmp-` prefix can never be an object name, which is hex. The object is
@@ -34,7 +33,7 @@
 //!   opened the file keeps the old version. The data directory is `flock`ed at [`Store::open`]
 //!   before the start-up walk of `objects/` deletes every leftover `.tmp-*` file and indexes
 //!   none.
-//! * **Durability (D32).** A `state` file in the data directory records the durability mode of
+//! * **Durability.** A `state` file in the data directory records the durability mode of
 //!   the run and `clean = true|false`. [`Store::open`], under the `flock` and before any mutation
 //!   or served read, loads the previous state, then writes the new one with `clean = false` and
 //!   syncs it (file, then directory). If the previous state is absent, unreadable, or
@@ -51,31 +50,31 @@
 //!   syncs nothing. This is Linux-only (macOS has no `syncfs`, which the configuration refuses).
 //!   The boot identifier is not consulted. Crash tests cover each persistent transition: before
 //!   and after `state` is written, mid-purge, during shutdown, and a failing `syncfs`.
-//! * **Index and readiness (D14).** The index is rebuilt from `objects/` at start-up, the recency
+//! * **Index and readiness.** The index is rebuilt from `objects/` at start-up, the recency
 //!   from `mtime`. Until it is built [`Store::is_ready`] is `false`, [`Store::admit`] answers
 //!   [`DropReason::NotReady`] without waiting, and reads are served straight from disk. Recency
 //!   is decided under the lock and written back to `mtime` outside it, at most once per
 //!   `touch_interval`, and for every late entry in [`Store::close`].
-//! * **Reads (D14, D33).** [`Store::read`] retries once when the file vanishes between the lookup
+//! * **Reads.** [`Store::read`] retries once when the file vanishes between the lookup
 //!   and the open, then answers `None`. [`Object::into_stream`] has two paths: an object of
 //!   64 KiB or less is read by one blocking task into a buffer of its size and leaves as a single
 //!   `Bytes`; a larger one streams as `ReaderStream::with_capacity(file.take(length), 64 KiB)`,
 //!   bounded by its known length, each block returning the blocking thread so a slow consumer
 //!   holds none of the shared pool. `ReaderStream::new` (4 KiB blocks) is forbidden: it divides
 //!   throughput by 6 to 10.
-//! * **Writes (D34, D43).** An object of at most 64 KiB is read into memory, bounded by its
-//!   announced size, then written, synced (D32), renamed and published in one blocking pass: no
+//! * **Writes.** An object of at most 64 KiB is read into memory, bounded by its
+//!   announced size, then written, synced, renamed and published in one blocking pass: no
 //!   channel, no owner task. A larger body goes through a bounded channel (depth 4) to one
 //!   blocking task that owns the temporary file, writes through a 64 KiB `BufWriter`, then
 //!   validates (`rename`, and `sync_all` before it in `fsync` mode). No `tokio::fs` write per
-//!   frame. Consuming the body starts without waiting (D7).
-//! * **No waiting between headers and body (D7).** [`Store::admit`] is synchronous and does no
+//!   frame. Consuming the body starts without waiting.
+//! * **No waiting between headers and body.** [`Store::admit`] is synchronous and does no
 //!   I/O. Nothing it takes can be held by a writer across I/O, and nothing in
 //!   [`Reservation::write`] waits for the index, an eviction or a key lock before it starts
 //!   consuming the body.
-//! * **Index and locking (D15, D35).** One `std::sync::Mutex` over the index, with O(1) critical
+//! * **Index and locking.** One `std::sync::Mutex` over the index, with O(1) critical
 //!   sections: never held across an `.await`, and **never across any I/O, [`Store::open`]
-//!   included**. One validation lock per shard of the digest (256, D43; not per key) serialises
+//!   included**. One validation lock per shard of the digest (256; not per key) serialises
 //!   every rename of that shard, its index publication, and every pending deletion and `mtime`
 //!   touch against each other; only writer and background tasks take it, always before the index
 //!   lock. Eviction deletions and `mtime` touches are decided
@@ -88,7 +87,7 @@
 //!
 //! Files live at `objects/<2 hex>/<64 hex>` (the blake3 digest of the key). The in-memory
 //! index ([`index::Index`]) maps that digest to a compact entry and keeps the LRU order in an
-//! intrusive list, behind the one `Mutex` of D15. Admission decides evictions under that lock;
+//! intrusive list, behind the one `Mutex`. Admission decides evictions under that lock;
 //! deletions, `mtime` touches, file opens and every other I/O run outside it, on the blocking
 //! pool. Validations and pending deletions of one shard are serialised against each other by the
 //! separate validation lock of that shard, so a deletion decided against an old generation can never unlink a version
@@ -122,21 +121,21 @@ use crate::key::{Key, object_path};
 use crate::metrics::Metrics;
 use index::{Digest, Index};
 
-/// Granularity of the space accounting (D12).
+/// Granularity of the space accounting.
 const BLOCK: u64 = 4096;
-/// Size of the chunks a read streams, so memory does not depend on object size (D15, D33).
+/// Size of the chunks a read streams, so memory does not depend on object size.
 const READ_CHUNK: usize = 64 * 1024;
-/// Objects at most this large are read by one blocking task into a single `Bytes` (D33).
+/// Objects at most this large are read by one blocking task into a single `Bytes`.
 const SMALL_OBJECT: u64 = 64 * 1024;
-/// Depth of the channel feeding a write's blocking task (D34).
+/// Depth of the channel feeding a write's blocking task.
 const WRITE_CHANNEL_DEPTH: usize = 4;
-/// `BufWriter` capacity of a write's blocking task (D34).
+/// `BufWriter` capacity of a write's blocking task.
 const WRITE_BUFFER: usize = 64 * 1024;
-/// Objects at most this large are written in one blocking pass (D43).
+/// Objects at most this large are written in one blocking pass.
 const SMALL_WRITE: u64 = 64 * 1024;
-/// Validation locks: one per leading digest byte, like the fan-out of `objects/` (D43).
+/// Validation locks: one per leading digest byte, like the fan-out of `objects/`.
 const VALIDATION_SHARDS: usize = 256;
-/// Name prefix of a file being written (D13). Object names are hex, so it never collides.
+/// Name prefix of a file being written. Object names are hex, so it never collides.
 const TEMP_PREFIX: &str = ".tmp-";
 /// Chunks a streaming read may have in flight: at most twice [`READ_CHUNK`] bytes per reader.
 const READ_CHANNEL_DEPTH: usize = 2;
@@ -183,7 +182,7 @@ impl Error {
     }
 }
 
-/// Why a PUT was not stored (D5). The label of `puts_dropped_total`.
+/// Why a PUT was not stored. The label of `puts_dropped_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DropReason {
     /// The announced size is above `max_object_size`.
@@ -192,7 +191,7 @@ pub(crate) enum DropReason {
     NoSpace,
     /// The index is still being built.
     NotReady,
-    /// An I/O error happened after admission (D13).
+    /// An I/O error happened after admission.
     Io,
 }
 
@@ -221,13 +220,13 @@ pub(crate) struct Object {
     /// Last modification time, for `Last-Modified`.
     #[expect(
         dead_code,
-        reason = "part of the frozen D29 API; http sends no Last-Modified on GET"
+        reason = "part of the API `http` calls; http sends no Last-Modified on GET"
     )]
     pub(crate) modified: SystemTime,
 }
 
 impl Object {
-    /// Streams the file in bounded chunks (D33): one blocking task reads a small object
+    /// Streams the file in bounded chunks: one blocking task reads a small object
     /// whole into a single `Bytes`; a larger one streams through a `ReaderStream` of
     /// [`READ_CHUNK`] blocks bounded by the known length, so the blocking thread is
     /// returned between blocks and a slow consumer holds none of the shared pool.
@@ -300,7 +299,8 @@ pub(crate) struct Stats {
 pub(crate) enum Admission {
     /// Room is reserved: pass the body to [`Reservation::write`].
     Reserved(Reservation),
-    /// The PUT will not be stored. Answer 200 (D5) after reading and discarding the body (D7).
+    /// The PUT will not be stored: answer 413, or 200 to Gradle, after reading and discarding
+    /// the body.
     Dropped(DropReason),
 }
 
@@ -310,7 +310,7 @@ pub(crate) enum Outcome {
     /// The object is stored and visible. Answer 201.
     Stored,
     /// An I/O error ended the write; the cause is logged at `error`. The body has been read to
-    /// its end, so the connection is healthy: answer 200 (D5).
+    /// its end, so the connection is healthy: answer 413, or 200 to Gradle.
     Dropped(DropReason),
     /// The body ended before the announced size, failed, or exceeded it. Nothing was stored.
     /// There is no client left to answer, or its request is malformed.
@@ -340,7 +340,7 @@ struct Hooks {
     fail_scan: AtomicBool,
     /// The start-up scan of a shard panics.
     panic_scan: AtomicBool,
-    /// The start-up scan waits while this is set, holding the `not_ready` window (D14).
+    /// The start-up scan waits while this is set, holding the `not_ready` window.
     hold_scan: AtomicBool,
     /// Free-disk samples wait while this is set, keeping the last one stale.
     hold_free_disk: AtomicBool,
@@ -352,9 +352,9 @@ struct Hooks {
     close_release: AtomicBool,
     /// `close_blocking` returned.
     close_done: AtomicBool,
-    /// Work handed to the blocking pool or a thread, by any task of the store (D43).
+    /// Work handed to the blocking pool or a thread, by any task of the store.
     dispatches: AtomicU64,
-    /// Body chunks sent to a write's owner task over its channel (D34).
+    /// Body chunks sent to a write's owner task over its channel.
     channel_sends: AtomicU64,
 }
 
@@ -384,7 +384,7 @@ fn close_point(inner: &Inner, point: ClosePoint) {
     }
 }
 
-/// Whether a clean state may still be published (D32): decided once, under one lock.
+/// Whether a clean state may still be published: decided once, under one lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseDecision {
     Pending,
@@ -397,7 +397,7 @@ enum CloseDecision {
 struct Inner {
     root: PathBuf,
     options: Options,
-    /// The index; held for a few O(1) instructions, never across I/O or an `.await` (D35).
+    /// The index; held for a few O(1) instructions, never across I/O or an `.await`.
     index: Mutex<Index>,
     /// One lock per shard of the digest, not per key: serialises every validation (rename
     /// and index publication) of a shard against the others, against pending deletions and
@@ -416,15 +416,15 @@ struct Inner {
     /// Background tasks (scan, deletions, touches, writers) still running; `close` waits
     /// for zero beyond itself before it may call the run clean.
     background: AtomicU64,
-    /// A free-disk refresh task is running (single-flight, D12).
+    /// A free-disk refresh task is running (single-flight).
     free_refreshing: AtomicBool,
     #[cfg(test)]
     hooks: Hooks,
-    /// The `objects/` directory, kept open from start-up: the `syncfs` observation handle
-    /// of D32, so writeback errors since start-up are reported to `close`.
+    /// The `objects/` directory, kept open from start-up: the `syncfs` observation handle,
+    /// so writeback errors since start-up are reported to `close`.
     #[cfg(target_os = "linux")]
     objects_dir: StdFile,
-    /// Held for the life of the process: the `flock` of D13.
+    /// Held for the life of the process: the `flock` on the data directory.
     _lock: StdFile,
 }
 
@@ -444,7 +444,7 @@ struct PendingDelete {
 #[repr(align(64))]
 struct Shard(Mutex<()>);
 
-/// The validation locks of D12, sharded by the leading byte of the digest (D43).
+/// The validation locks, sharded by the leading byte of the digest.
 #[derive(Debug)]
 struct Validation {
     shards: Box<[Shard]>,
@@ -561,7 +561,7 @@ fn free_disk_now(inner: &Inner) -> u64 {
     sample_free_disk(&inner.root)
 }
 
-/// Samples free disk space off the request path, so `admit` does no I/O (D7). The mark is
+/// Samples free disk space off the request path, so `admit` does no I/O. The mark is
 /// read before the sample, so every reservation the sample may miss stays debited.
 fn refresh_free_disk(inner: &Inner) {
     #[cfg(test)]
@@ -582,7 +582,7 @@ fn refresh_free_disk(inner: &Inner) {
 }
 
 /// Starts one background free-disk refresh if none is running, so a store refusing for
-/// `min_free_disk` recovers as soon as space returns (D12).
+/// `min_free_disk` recovers as soon as space returns.
 fn refresh_free_disk_async(inner: &Arc<Inner>) {
     if inner
         .free_refreshing
@@ -597,7 +597,7 @@ fn refresh_free_disk_async(inner: &Arc<Inner>) {
     }
 }
 
-/// The high watermark a background sweep keeps `live` at or below (D12): 95 % of
+/// The high watermark a background sweep keeps `live` at or below: 95 % of
 /// `max_size`, so admissions in a full store find room without waiting for unlinks.
 fn watermark(max_size: u64) -> u64 {
     max_size.saturating_sub(max_size / 20)
@@ -653,7 +653,7 @@ impl Store {
         Ok(Self::start(inner))
     }
 
-    /// Starts the scan that rebuilds the index in the background (D14, D36): reads are
+    /// Starts the scan that rebuilds the index in the background: reads are
     /// served from disk meanwhile, admissions answer `not_ready`.
     fn start(inner: Inner) -> Self {
         let inner = Arc::new(inner);
@@ -676,7 +676,7 @@ impl Store {
         let digest = digest_of(key);
         let path = object_path(&self.inner.root, &digest.0);
         // Two attempts: an eviction (or a rewrite) between the lookup and the open answers
-        // absent, or the newer version's bytes — never an error (D14).
+        // absent, or the newer version's bytes — never an error.
         for _attempt in 0..2 {
             if self.is_ready() {
                 let hit = {
@@ -730,7 +730,7 @@ impl Store {
         let digest = digest_of(key);
         if self.is_ready() {
             // From the index, without I/O — and without refreshing recency: a `HEAD` probe
-            // is not a hit (D14 reserves that to reads).
+            // is not a hit; only reads refresh recency.
             let index = self.inner.index.lock().expect("index lock poisoned");
             return Ok(index
                 .peek(digest)
@@ -778,7 +778,7 @@ impl Store {
                 disk_refused = true;
                 false
             } else {
-                // D12: evict only for this reservation's own room in `live` — never to
+                // Evict only for this reservation's own room in `live` — never to
                 // cover deletions already in flight. Evictions are collected first, so
                 // an admission that cannot fit in `live` evicts nothing.
                 let over = index
@@ -870,7 +870,7 @@ impl Store {
 
     /// The first step of a shutdown, synchronous and without I/O: closes admissions and
     /// stops retrying refused deletions, so no background task outlives the shutdown
-    /// deadline even when draining spends it all and [`Store::close`] never runs (D32).
+    /// deadline even when draining spends it all and [`Store::close`] never runs.
     pub(crate) fn begin_close(&self) {
         // Under the index lock, so no admission can slip between the check there and this
         // store: every reservation is either in `reserved` (and waited for) or refused.
@@ -882,7 +882,7 @@ impl Store {
     ///
     /// Closes admissions, waits for every writer, background task and outstanding
     /// reservation, persists late recency, then — `purge-on-crash` only — runs a checked
-    /// `syncfs` before writing `clean = true` (D32). The caller bounds it with the shutdown
+    /// `syncfs` before writing `clean = true`. The caller bounds it with the shutdown
     /// deadline by dropping this future: a close dropped before it finished never writes
     /// `clean = true`, though its blocking half runs on until it notices.
     ///
@@ -900,7 +900,7 @@ impl Store {
 }
 
 /// Abandons the close unless disarmed: [`Store::close`] dropped before it finished was
-/// cancelled or ran past the shutdown deadline, which forbids `clean = true` (D32).
+/// cancelled or ran past the shutdown deadline, which forbids `clean = true`.
 struct AbandonCloseOnDrop(Option<Arc<Inner>>);
 
 impl Drop for AbandonCloseOnDrop {
@@ -941,7 +941,7 @@ async fn open_object(path: &Path) -> Result<Option<Object>, Error> {
 
 /// Runs `attempt` (one unlink of `path`) until the file is gone, sleeping with backoff
 /// between refusals: only a successful unlink or `ENOENT` ends it, so the caller releases
-/// a charge only once its file is gone (D12). A closing store admits nothing more and
+/// a charge only once its file is gone. A closing store admits nothing more and
 /// stops retrying instead, so `close` never waits on a refusal that may not lift; the file
 /// left behind is deleted (a `.tmp-*` file) or indexed again (an object) at the next start-up.
 fn retry_unlink(inner: &Inner, path: &Path, mut attempt: impl FnMut() -> io::Result<()>) {
@@ -979,7 +979,7 @@ fn unlink_with_retry(inner: &Inner, path: &Path) {
     retry_unlink(inner, path, || std::fs::remove_file(path));
 }
 
-/// Sets a file's `mtime` to `when` (the persisted recency, D14), unless the version it
+/// Sets a file's `mtime` to `when` (the persisted recency), unless the version it
 /// was decided for is gone. The generation is rechecked under the validation lock,
 /// which also keeps a rename from landing between the check and the update. Only a
 /// successful write counts as persisted; a failed one stays late for `close` to retry.
@@ -1019,7 +1019,7 @@ fn touch(inner: &Inner, digest: Digest, path: &Path, when: SystemTime, generatio
 /// Deletes one evicted object, unless a newer version was committed after the eviction
 /// was decided. The validation lock makes the generation check and the unlink atomic
 /// against a commit's rename. A failed unlink keeps the charge in `pending` and is
-/// retried with backoff, the generation rechecked on every attempt (D12); only a
+/// retried with backoff, the generation rechecked on every attempt; only a
 /// successful unlink, `ENOENT`, or a superseding version releases the charge.
 fn delete_pending(inner: &Arc<Inner>, pending: &PendingDelete) {
     #[cfg(test)]
@@ -1045,7 +1045,7 @@ fn delete_pending(inner: &Arc<Inner>, pending: &PendingDelete) {
     refresh_free_disk(inner);
 }
 
-/// The persisted run state of D32: the durability mode of the run that wrote it, and
+/// The persisted run state: the durability mode of the run that wrote it, and
 /// whether that run shut down cleanly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct State {
@@ -1060,7 +1060,7 @@ fn mode_name(mode: Durability) -> &'static str {
     }
 }
 
-/// Reads `state`; absent, unreadable and malformed all read as `None` (each purges, D32).
+/// Reads `state`; absent, unreadable and malformed all read as `None` (each purges).
 /// The second value says whether a state file exists at all: a first boot on an empty
 /// directory purges nothing and is initialisation, not a crash purge.
 fn read_state(root: &Path) -> (Option<State>, bool) {
@@ -1223,7 +1223,7 @@ fn open_blocking(root: PathBuf, options: Options) -> Result<Inner, Error> {
         Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Locked(root)),
         Err(std::fs::TryLockError::Error(e)) => return Err(Error::io("lock", &lock_path)(e)),
     }
-    // D32, under the flock and before any mutation or served read. While a purge runs, the
+    // Under the flock and before any mutation or served read. While a purge runs, the
     // state on disk still demands one (`purge-on-crash`, not clean), so an interrupted
     // purge starts over at the next start instead of serving what it had not reached.
     let (previous, state_existed) = read_state(&root);
@@ -1305,7 +1305,7 @@ fn scan_shard(shard: &Path, out: &mut Vec<Scanned>) -> Result<(), Error> {
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_owned();
-    // Something gone since it was listed holds nothing to index (D14: `ENOENT` is absent).
+    // Something gone since it was listed holds nothing to index: `ENOENT` means absent.
     let read = match std::fs::read_dir(shard) {
         Ok(read) => read,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1321,7 +1321,7 @@ fn scan_shard(shard: &Path, out: &mut Vec<Scanned>) -> Result<(), Error> {
         };
         if name.starts_with(TEMP_PREFIX) {
             // An upload a previous run never finished. Nothing writes during the scan:
-            // admissions answer `not_ready` until it ends (D14).
+            // admissions answer `not_ready` until it ends.
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1356,7 +1356,7 @@ fn scan_shard(shard: &Path, out: &mut Vec<Scanned>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Collects every object under `objects/` (D36): shards scanned in parallel with local
+/// Collects every object under `objects/`: shards scanned in parallel with local
 /// accumulation. An I/O error or a panicked scan thread is an error, never a partial
 /// index: serving from half a tree would under-count the disk silently.
 fn collect_scan(inner: &Inner) -> Result<Vec<Scanned>, Error> {
@@ -1397,7 +1397,7 @@ fn collect_scan(inner: &Inner) -> Result<Vec<Scanned>, Error> {
     })
 }
 
-/// Rebuilds the index from `objects/` (D36): one sort by `mtime`, the map built at
+/// Rebuilds the index from `objects/`: one sort by `mtime`, the map built at
 /// exact capacity. Objects above `max_size` (a shrunk configuration) are evicted,
 /// oldest first, and deleted here before readiness — admissions answer `not_ready`
 /// meanwhile, so no pending bytes outlive the scan.
@@ -1530,7 +1530,7 @@ fn abandoned_error(inner: &Inner) -> Error {
     ))
 }
 
-/// `syncfs` on the objects' file system, success checked (D32). Linux only: elsewhere a
+/// `syncfs` on the objects' file system, success checked. Linux only: elsewhere a
 /// `purge-on-crash` run can never be certified clean, so close fails and the next start
 /// purges — the configuration already refuses the mode off Linux.
 fn syncfs_checked(inner: &Inner) -> Result<(), Error> {
@@ -1570,7 +1570,7 @@ pub(crate) struct Reservation {
     settled: bool,
 }
 
-/// One message to a write's blocking task (D34).
+/// One message to a write's blocking task.
 enum WriteMsg {
     Chunk(Bytes),
     /// The body stream ended normally; the writer may commit. A channel that closes
@@ -1595,7 +1595,7 @@ fn release_reservation(inner: &Inner, digest: Digest, charged: u64) {
 
 fn remove_temporary(inner: &Inner, path: &Path) {
     // Same rule as object deletions: the reservation is released only once the
-    // temporary is actually gone (D12).
+    // temporary is actually gone.
     unlink_with_retry(inner, path);
 }
 
@@ -1603,7 +1603,7 @@ impl Reservation {
     /// Reads `body` to its end, stores it under the reserved key and says how it went.
     ///
     /// The announced size must match the bytes received exactly. After an I/O error the rest of
-    /// the body is read and discarded before returning (D7), so the client's connection stays
+    /// the body is read and discarded before returning, so the client's connection stays
     /// usable. The cause of an I/O failure is logged here at `error`. Dropping the future
     /// cancels the write.
     pub(crate) async fn write<S, E>(mut self, body: S) -> Outcome
@@ -1676,7 +1676,7 @@ impl Reservation {
     }
 }
 
-/// The path of a fresh temporary file next to `destination` (D13).
+/// The path of a fresh temporary file next to `destination`.
 fn temporary_path(inner: &Inner, destination: &Path) -> PathBuf {
     let id = inner.next_tmp.fetch_add(1, Ordering::Relaxed);
     destination.with_file_name(format!("{TEMP_PREFIX}{id}"))
@@ -1713,7 +1713,7 @@ fn abandon(
     result
 }
 
-/// The write's one blocking task (D34): owns the temporary file, writes through a
+/// The write's one blocking task: owns the temporary file, writes through a
 /// [`WRITE_BUFFER`] `BufWriter`, then validates in the same task.
 fn writer_blocking(
     inner: &Arc<Inner>,
@@ -1761,7 +1761,7 @@ fn writer_blocking(
     }
 }
 
-/// The whole write of a small object in one blocking pass (D43): `data` is the complete
+/// The whole write of a small object in one blocking pass: `data` is the complete
 /// body, already checked against the announced size, so there is nothing left to wait for.
 /// Runs the post-store sweep and free-disk sample here too, since the pass has no later
 /// stage to defer them to.
@@ -1793,7 +1793,7 @@ fn write_small_blocking(
     result
 }
 
-/// Syncs the finished temporary (`fsync` mode, D32), renames it into place and publishes
+/// Syncs the finished temporary (`fsync` mode), renames it into place and publishes
 /// it: the part of a write both paths share.
 fn validate(
     inner: &Arc<Inner>,
@@ -1815,7 +1815,7 @@ fn validate(
         // One validation section covers the rename and its publication (index commit,
         // reservation conversion, unpin), in validation → index order: a pending
         // deletion or a competing writer of the same shard can only run before the rename
-        // or after the entry exists, never between them (D12).
+        // or after the entry exists, never between them.
         let _validation = inner.validation.lock(digest);
         if let Err(e) = std::fs::rename(&temporary, destination) {
             let result = WriteResult::Io(Error::io("rename", destination)(e));
@@ -1843,7 +1843,7 @@ fn validate(
 }
 
 impl Reservation {
-    /// [`Reservation::write`] for an object of at most [`SMALL_WRITE`] bytes (D43): the body is
+    /// [`Reservation::write`] for an object of at most [`SMALL_WRITE`] bytes: the body is
     /// read into memory first, bounded by the announced size, then one blocking pass stores it.
     /// Until that pass starts the reservation is unsettled, so a dropped future, a failed body
     /// or a wrong length cancel it through `Drop` and nothing was ever created.
@@ -1895,8 +1895,8 @@ impl Reservation {
 impl Drop for Reservation {
     /// Cancels an unsettled reservation (one [`Reservation::write`] never took): no file
     /// exists yet, only the room and the pin are held. The release is handed to the
-    /// blocking pool and the room stays charged until it runs, so D12 holds meanwhile and
-    /// the dropping thread never does the store's bookkeeping synchronously (P3). Without
+    /// blocking pool and the room stays charged until it runs, so the size bound holds
+    /// meanwhile and the dropping thread never does the store's bookkeeping synchronously. Without
     /// a runtime there is nowhere to hand it to; the O(1) release runs inline, file-free.
     fn drop(&mut self) {
         if self.settled {
@@ -2091,7 +2091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_follows_d12() {
+    async fn admission_is_bounded_by_size_and_object_size() {
         let dir = TempDir::new().unwrap();
         let mut opts = options(2 * BLOCK);
         opts.max_object_size = BLOCK;
@@ -2265,7 +2265,7 @@ mod tests {
             Outcome::Stored
         );
         // `d` first evicts `b` for its own room, then drops: the pending bytes still
-        // occupy the disk (D12). Once they are deleted the retry is stored.
+        // occupy the disk. Once they are deleted the retry is stored.
         assert_eq!(
             put_vec(&store, &key("d"), vec![4; 9000]).await,
             Outcome::Dropped(DropReason::NoSpace)
@@ -2311,7 +2311,7 @@ mod tests {
         );
     }
 
-    // D13, D32: after an unclean `purge-on-crash` run nothing is left: no object, and no
+    // After an unclean `purge-on-crash` run nothing is left: no object, and no
     // temporary an interrupted upload left in a shard.
     #[tokio::test]
     async fn crash_purge_start_leaves_no_object_and_no_temporary() {
@@ -2361,7 +2361,8 @@ mod tests {
         }
     }
 
-    /// Charged bytes of every file under `objects/`, temporaries included: the D12 disk measure.
+    /// Charged bytes of every file under `objects/`, temporaries included: what the size bound
+    /// counts on disk.
     fn disk_charged(dir: &Path) -> u64 {
         let mut total = 0_u64;
         for path in walk(&dir.join("objects")) {
@@ -2379,7 +2380,7 @@ mod tests {
             .count()
     }
 
-    // Criterion 1: the measured disk occupation never exceeds `max_size`.
+    // The measured disk occupation never exceeds `max_size`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_puts_never_exceed_max_size() {
         let dir = TempDir::new().unwrap();
@@ -2429,7 +2430,7 @@ mod tests {
         .await;
     }
 
-    // Criterion 1b: a pending deletion of the old version must not remove the new one.
+    // A pending deletion of the old version must not remove the new one.
     #[tokio::test]
     async fn evicted_then_rewritten_key_survives_pending_delete() {
         let dir = TempDir::new().unwrap();
@@ -2476,7 +2477,7 @@ mod tests {
         );
     }
 
-    // Criterion 1c: eviction between lookup and open is absent or the new bytes, never Err.
+    // Eviction between lookup and open is absent or the new bytes, never Err.
     #[tokio::test]
     async fn read_racing_an_eviction_is_absent_or_new_bytes() {
         let dir = TempDir::new().unwrap();
@@ -2496,7 +2497,7 @@ mod tests {
         );
     }
 
-    // Criterion 2: one key, many writers, exactly one whole content wins.
+    // One key, many writers, exactly one whole content wins.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writes_of_one_key_never_mix() {
         let dir = TempDir::new().unwrap();
@@ -2527,7 +2528,7 @@ mod tests {
         assert_eq!(stats.size_bytes, charge(u64::try_from(got.len()).unwrap()));
     }
 
-    // Criterion 3: a reader keeps its version across an eviction (POSIX open file).
+    // A reader keeps its version across an eviction (POSIX open file).
     #[tokio::test]
     async fn eviction_during_a_large_read_loses_nothing() {
         let dir = TempDir::new().unwrap();
@@ -2561,7 +2562,7 @@ mod tests {
         assert_eq!(streamed, big);
     }
 
-    // Criterion 4: recency survives a restart through `mtime`.
+    // Recency survives a restart through `mtime`.
     #[tokio::test]
     async fn recency_persists_across_a_reopen() {
         let dir = TempDir::new().unwrap();
@@ -2603,7 +2604,7 @@ mod tests {
         );
     }
 
-    // Criterion 5: crash leftovers in `tmp/` do not survive or get served.
+    // Crash leftovers in `tmp/` do not survive or get served.
     #[tokio::test]
     async fn crash_leftovers_do_not_survive_a_restart() {
         let dir = TempDir::new().unwrap();
@@ -2746,9 +2747,9 @@ mod tests {
         assert_eq!(contents(&store, &key("p0")).await.unwrap(), vec![9; 5000]);
     }
 
-    // D33: small objects are one `Bytes`; large ones are 64 KiB blocks.
+    // Small objects are one `Bytes`; large ones are 64 KiB blocks.
     #[tokio::test]
-    async fn read_stream_shapes_follow_d33() {
+    async fn read_stream_shapes_follow_object_size() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path(), options(MIB)).await.unwrap();
         assert_eq!(
@@ -2774,7 +2775,7 @@ mod tests {
         assert_eq!(chunks.concat(), vec![4; 200 * 1024]);
     }
 
-    // Criterion 7: a 1 GiB object streams in bounded blocks (sparse file on disk).
+    // A 1 GiB object streams in bounded blocks (sparse file on disk).
     #[tokio::test]
     async fn one_gib_object_streams_in_bounded_blocks() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -2801,7 +2802,7 @@ mod tests {
         assert_eq!(blocks, GIB / u64::try_from(READ_CHUNK).unwrap());
     }
 
-    // Criterion 9: the D32 decision table, state by crafted state.
+    // The purge decision table, state by crafted state.
     #[test]
     fn purge_decision_table() {
         assert!(purge_needed(None), "absent state must purge");
@@ -2930,9 +2931,8 @@ mod tests {
         );
     }
 
-    // Criterion 8 (local, not CI): parallel 1 MiB PUT/GET throughput, so the review can
-    // see the cost of the one index mutex. Run in release:
-    // `cargo test --release bench_ -- --ignored --nocapture`.
+    // Local, not CI: parallel 1 MiB PUT/GET throughput, to see the cost of the one index
+    // mutex. Run in release: `cargo test --release bench_ -- --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "local microbench"]
     async fn bench_put_get_1mib_parallel() {
@@ -2982,7 +2982,7 @@ mod tests {
         );
     }
 
-    // D33 (local, not CI): one-shot whole read vs 64 KiB streaming at 64/128/256 KiB.
+    // Local, not CI: one-shot whole read vs 64 KiB streaming at 64/128/256 KiB.
     #[tokio::test]
     #[ignore = "local microbench"]
     async fn bench_read_one_shot_vs_streaming() {
@@ -3025,7 +3025,7 @@ mod tests {
         }
     }
 
-    // D36 (local, not CI): time to readiness over a prepared tree. Point
+    // Local, not CI: time to readiness over a prepared tree. Point
     // `CACHETTE_BENCH_SCAN_DIR` at a data directory holding `objects/` and a clean
     // `state`; prints entries and scan time.
     #[tokio::test]
@@ -3070,8 +3070,8 @@ mod tests {
         store.inner.index.lock().unwrap().charged_total()
     }
 
-    // D12: with deletions held, accounting and disk never exceed the ceiling, and the
-    // PUT that would spend not-yet-freed bytes is dropped `no_space` (Sol P1, 8 192).
+    // With deletions held, accounting and disk never exceed the ceiling, and the
+    // PUT that would spend not-yet-freed bytes is dropped `no_space`.
     #[tokio::test]
     async fn ceiling_holds_with_pending_deletions_held() {
         let dir = TempDir::new().unwrap();
@@ -3099,8 +3099,8 @@ mod tests {
         assert!(disk <= 2 * BLOCK, "disk {disk} above the ceiling");
     }
 
-    // D12 under sustained load: the accounted total, sampled at every admission, stays
-    // under the ceiling, and the index equals the disk once drained (Sol P1).
+    // Under sustained load the accounted total, sampled at every admission, stays
+    // under the ceiling, and the index equals the disk once drained.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sustained_load_never_exceeds_the_ceiling() {
         let dir = TempDir::new().unwrap();
@@ -3141,8 +3141,8 @@ mod tests {
         assert_eq!(accounted_total(&store), disk_charged(dir.path()));
     }
 
-    // D12: after a restart with a reduced `max_size`, one small PUT must not evict the
-    // live entries to cover deletions already in flight (Opus P2.2b).
+    // After a restart with a reduced `max_size`, one small PUT must not evict the
+    // live entries to cover deletions already in flight.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reduced_max_size_put_does_not_evict_live_for_pending() {
         let dir = TempDir::new().unwrap();
@@ -3187,7 +3187,7 @@ mod tests {
         );
     }
 
-    // D12: an admission evicts only for its own room in live bytes. With an earlier
+    // An admission evicts only for its own room in live bytes. With an earlier
     // eviction still pending, a PUT that fits live but not live + pending is dropped
     // without evicting anything.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3230,7 +3230,7 @@ mod tests {
     }
 
     // A deletion decided before a rewrite must not unlink the rewritten file while its
-    // writer sits between `rename` and the index commit (Sol/Opus publish window).
+    // writer sits between `rename` and the index commit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pending_delete_cannot_remove_rewrite_in_publish_window() {
         let dir = TempDir::new().unwrap();
@@ -3290,7 +3290,7 @@ mod tests {
     }
 
     // Two writers of one key: the index must describe the version the renames left on
-    // disk, so HEAD (`stat`) and GET agree (Sol rename order).
+    // disk, so HEAD (`stat`) and GET agree.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rename_order_matches_index_publication() {
         let dir = TempDir::new().unwrap();
@@ -3332,7 +3332,7 @@ mod tests {
     }
 
     // A temporary whose unlink is refused keeps its reservation until the retried
-    // unlink lands (D12: the same rule as evicted objects).
+    // unlink lands, the same rule as for evicted objects.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn refused_temporary_unlink_keeps_its_reservation() {
@@ -3409,8 +3409,8 @@ mod tests {
         .await;
     }
 
-    // Cancelling `write` after exactly the announced bytes still stores nothing
-    // (Sol P3): only an explicit end-of-body may commit.
+    // Cancelling `write` after exactly the announced bytes still stores nothing:
+    // only an explicit end-of-body may commit.
     #[tokio::test]
     async fn cancel_after_exact_bytes_does_not_commit() {
         let dir = TempDir::new().unwrap();
@@ -3438,7 +3438,7 @@ mod tests {
         assert_eq!(temporaries(&dir), 0);
     }
 
-    // A recency touch decided for an old version must not age its replacement (Sol P3).
+    // A recency touch decided for an old version must not age its replacement.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn old_touch_does_not_age_replacement() {
         let dir = TempDir::new().unwrap();
@@ -3483,7 +3483,7 @@ mod tests {
         );
     }
 
-    // Slow readers must not park the shared blocking pool (Sol P2, D33).
+    // Slow readers must not park the shared blocking pool.
     #[test]
     fn large_reads_do_not_starve_the_blocking_pool() {
         use std::pin::Pin;
@@ -3521,7 +3521,7 @@ mod tests {
         });
     }
 
-    // Once the disk recovers, `min_free_disk` refusals stop without a restart (Opus P2.3).
+    // Once the disk recovers, `min_free_disk` refusals stop without a restart.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn min_free_disk_recovers_after_space_is_freed() {
         const MIB128: u64 = 128 * 1024 * 1024;
@@ -3567,7 +3567,7 @@ mod tests {
         );
     }
 
-    // `close` waits for a reservation that has not started writing yet (Opus P3).
+    // `close` waits for a reservation that has not started writing yet.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn close_waits_for_an_outstanding_reservation() {
         let dir = TempDir::new().unwrap();
@@ -3640,7 +3640,7 @@ mod tests {
         );
     }
 
-    // D12: until a sample covers it, every admitted reservation is debited from the known
+    // Until a sample covers it, every admitted reservation is debited from the known
     // free space, so a stale sample never admits below `min_free_disk`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stale_free_sample_never_admits_below_min_free_disk() {
@@ -3721,7 +3721,7 @@ mod tests {
         );
     }
 
-    // D32: a close cancelled at any point of its path never publishes `clean = true`,
+    // A close cancelled at any point of its path never publishes `clean = true`,
     // even once its blocking half reaches the publication.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelled_close_never_publishes_clean() {
@@ -3762,7 +3762,7 @@ mod tests {
         }
     }
 
-    // D14: a touch whose `mtime` write fails is not persisted; `close` writes it.
+    // A touch whose `mtime` write fails is not persisted; `close` writes it.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failed_touch_is_retried_by_close() {
@@ -3794,7 +3794,7 @@ mod tests {
         assert!(closed > old, "close did not retry the failed touch");
     }
 
-    // A close dropped at the shutdown deadline never writes `clean = true` (D32), even
+    // A close dropped at the shutdown deadline never writes `clean = true`, even
     // once what it was waiting for completes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn abandoned_close_never_writes_clean() {
@@ -3892,8 +3892,8 @@ mod tests {
         .await;
     }
 
-    // D43: an object of at most 64 KiB is stored by one blocking pass with no channel; a
-    // larger one keeps the streaming path (D34).
+    // An object of at most 64 KiB is stored by one blocking pass with no channel; a
+    // larger one keeps the streaming path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn small_put_is_one_blocking_pass() {
         let dir = TempDir::new().unwrap();
@@ -3973,7 +3973,7 @@ mod tests {
         writer
     }
 
-    // D43: a validation held in its critical section does not delay another shard's.
+    // A validation held in its critical section does not delay another shard's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn validations_of_different_shards_run_in_parallel() {
         let dir = TempDir::new().unwrap();
@@ -4000,7 +4000,7 @@ mod tests {
         assert_eq!(first.await.unwrap(), Outcome::Stored);
     }
 
-    // D12, D43: two validations of one shard still exclude each other.
+    // Two validations of one shard still exclude each other.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn validations_of_one_shard_exclude_each_other() {
         let dir = TempDir::new().unwrap();

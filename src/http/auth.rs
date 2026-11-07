@@ -1,4 +1,4 @@
-//! Authentication (D11): who is asking, and whether their token allows the request.
+//! Authentication: who is asking, and whether their token allows the request.
 //!
 //! The secret comes as the password of a Basic header (the user name is ignored, since Gradle can
 //! only do Basic), as Basic encoded in base64url with or without padding (Bazel), or as a Bearer

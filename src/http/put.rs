@@ -1,4 +1,4 @@
-//! `PUT` on a key (D4 to D7).
+//! `PUT` on a key.
 
 use axum::body::Body;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, EXPECT};
@@ -11,7 +11,7 @@ use crate::store::{Admission, DropReason, Outcome};
 
 /// Decides on the headers, then streams the body into the store.
 ///
-/// Nothing between the headers and the first read of the body waits (D7): the store admits
+/// Nothing between the headers and the first read of the body waits: the store admits
 /// synchronously, and `write` starts consuming the stream at once.
 pub(super) async fn put(
     state: &State,
@@ -56,7 +56,7 @@ pub(super) async fn put(
     }
 }
 
-/// The PUT is not stored; the answer must still leave the connection usable (D5, D7).
+/// The PUT is not stored; the answer must still leave the connection usable.
 ///
 /// With `Expect: 100-continue` the answer goes out unread: hyper sends no `100`, and the client
 /// keeps its body. Without it the client has already written the body, and answering before it
@@ -77,12 +77,12 @@ async fn abandon(
     handled
 }
 
-/// The answer to a PUT that is not stored, whatever the reason (D5): the one place that picks
+/// The answer to a PUT that is not stored, whatever the reason: the one place that picks
 /// its status.
 fn not_stored(parts: &Parts, reason: DropReason) -> Handled {
-    // Gradle's HttpBuildCacheService.store throws on any non-2xx status and the remote cache is
-    // then off for the rest of the build, so it gets 200; `tests/clients/gradle/run.sh d5` fails
-    // when Gradle gets 413.
+    // Despite its docs, Gradle's `HttpBuildCache` turns the remote cache off for the rest of the
+    // build on any non-2xx status of a PUT, so it gets 200; the `refused` scenario of
+    // `tests/clients/gradle/run.sh` fails when Gradle gets 413.
     let status = if is_gradle_artifact(&parts.headers) {
         StatusCode::OK
     } else {
@@ -121,7 +121,7 @@ fn expects_continue(headers: &HeaderMap) -> bool {
 /// Why a PUT has no usable `Content-Length`.
 #[derive(Debug, Clone, Copy)]
 enum Unframed {
-    /// Chunked or unframed: `411` (D6).
+    /// Chunked or unframed: `411`.
     Missing,
     /// Present but not a number.
     Invalid,
@@ -139,7 +139,7 @@ impl Unframed {
     }
 }
 
-/// The body length from `Content-Length`, which D6 makes mandatory. hyper drops the header of a
+/// The body length from `Content-Length`, which a PUT must carry. hyper drops the header of a
 /// chunked request, so a chunked PUT has none.
 fn announced_size(headers: &HeaderMap) -> Result<u64, Unframed> {
     let value = headers.get(CONTENT_LENGTH).ok_or(Unframed::Missing)?;

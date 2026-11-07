@@ -1,31 +1,30 @@
 # Reproducible HTTP cache benchmark
 
-`run.py` is the single entry point. It uses Python's standard library, Docker on
-the Linux x86_64 server host for servers and the loopback client, and a native
-oha build on the macOS arm64 client host for the Tailscale client. No Python
+`run.py` is the single entry point. It uses Python's standard library and Docker on
+a Linux x86_64 host, for the servers and the loopback client. No Python
 packages are needed. The [final run](results/2026-11-06T204503Z-linux-x86_64-16t.md)
 measures cachette's real store and HTTP path; the comparison in the top-level README
 comes from it.
 
-## Loopback replay on the server host
+## Loopback replay
 
-On the server host, from the repository root, with Docker and `timeout`, `df`,
+On the Linux host, from the repository root, with Docker and `timeout`, `df`,
 `findmnt`, `lsblk`, `uptime` and `nproc` installed:
 
 ```sh
 sudo timeout 3600 python3 -B bench/run.py --servers nginx foster bazel --seconds 5 --work-dir ~/cachette-bench
 ```
 
-After store/http merge, omit `--servers` to include **both** cachette variants:
+Omit `--servers` to include **both** cachette variants:
 
 ```sh
 sudo timeout 3600 python3 -B bench/run.py --seconds 10 --work-dir ~/cachette-bench
 ```
 
 All 24 points (GET/PUT × 4 KiB/64 KiB/1 MiB/32 MiB × c1/16/64) run twice
-consecutively per server/variant. The 64 KiB point is the D33 inclusive small-read
-boundary. The four-server run has five variants and at least 40 minutes of timed
-load at the default 10 seconds, before builds, pressure and request drain.
+consecutively per server/variant. The 64 KiB point is the inclusive size up to which
+cachette reads an object whole instead of streaming it. The four-server run has five
+variants and at least 40 minutes of timed load at the default 10 seconds, before builds, pressure and request drain.
 For longer stability measurements use `timeout 10800` and `--seconds 30`.
 
 `--seconds`, `--cap-mib` (default 4096), `--max-load` (default 2) and `--results`
@@ -36,7 +35,7 @@ are recorded overrides. The runner refuses any occupied port 18080–18083, a
 before replaying. Load is not a disk-isolation guarantee.
 
 Use only `~/cachette-bench/` and the `cachette-bench-*` container prefix on the
-server host.
+host.
 Each server runs alone with `--network host`, on 18080 (cachette), 18081 (nginx),
 18082 (fosterstack), or 18083 (bazel-remote). Loopback runs bind only 127.0.0.1.
 Each variant starts from the same freshly emptied `<work-dir>/run-*/data` path
@@ -45,74 +44,19 @@ Containers and data are removed in `finally`, including SIGTERM. Images/build
 cache remain. SIGKILL, host failure or Docker failure can prevent cleanup:
 inspect the run's named resources before removing them; never stop another service.
 
-## Tailscale replay: client host and server host
-
-Build the same pinned oha source natively on the client host. External source goes
-in `/tmp`; dependencies are locked. This is setup, outside all measurement
-intervals:
-
-```sh
-git clone https://github.com/hatoo/oha /tmp/cachette-bench-oha
-git -C /tmp/cachette-bench-oha checkout 9766ca2b725b69b7606b99861d01c779b4aeb65d
-timeout 900 cargo build --locked --release --manifest-path /tmp/cachette-bench-oha/Cargo.toml --target-dir "$HOME/cachette-bench/oha-target" -j 2
-```
-
-The two checkouts must have the same commit. Update the dedicated checkout on
-the server host to this branch, then run **on the client host**, without sudo:
-
-```sh
-timeout 3600 python3 -B bench/run.py --remote <server-host> --oha "$HOME/cachette-bench/oha-target/release/oha" --servers nginx foster bazel --seconds 10
-```
-
-`<server-host>` is an SSH alias for the server host. `--remote-root` defaults to
-`~/cachette-bench/repo` there, and the worker's work directory to `~/cachette-bench`.
-A path starting with `~/` is resolved against the home of the user SSH logs in as.
-
-After store/http merge, omit `--servers` for both cachette durability modes.
-The subset is GET hit and PUT × 4 KiB/1 MiB × c1/16, twice consecutively: 48
-measurements for the three competitors, or 80 including both cachette modes.
-RSS and eviction pressure belong to the full loopback matrix and are not repeated
-over Tailscale. `--preflight-only` with the same remote/client flags checks the
-client host's load and oha without starting remote servers.
-
-SSH is the control plane only. Timed HTTP goes directly from native oha on the
-client host to the server host's `tailscale ip -4`, without SSH forwarding.
-Servers bind **only that Tailscale IPv4**, never 0.0.0.0 or the public address. No
-firewall or tailnet ACL is changed. Existing tailnet policy must allow the client
-host to the server host on TCP 18080–18083; otherwise the run fails and no
-successful result is published. Other tailnet members allowed by that policy can
-reach the disposable listeners during the run. nginx/bazel are unauthenticated;
-all listeners disappear at cleanup.
-
-The client host refuses load >2 by default, initially and before every measured
-cell. The remote runner applies the server host's guard before and after builds.
-Do not raise the threshold just to obtain a publishable result from a busy client
-host. A refusal is a missing measurement, not evidence of network speed.
-
-Reports retain `tailscale ping --c 3 --until-direct=false` before and after each
-cell: RTT samples and the direct endpoint or DERP route, not an inferred path.
-They record host versions, initial uptime, per-cell loads, useful MiB/s, p50/p99,
-errors and whole-host busy CPU percentages. CPU comes from cumulative Linux
-`/proc/stat` counters (idle+iowait counted idle), and macOS `host_statistics`
-CPU ticks. The client host's interval brackets oha; the server host's interval
-brackets the measure request and its reply, adding about one control-plane round
-trip. Body transfer and the pre/post ping probes are outside both intervals. These
-host-wide intervals include unrelated workloads and Tailscale and do not attribute
-CPU to the server alone. A route can change during an HTTP interval.
-
 ## Versions, durability and semantics
 
 | Variant | Durability used in tables | Configuration |
 |---|---|---|
-| cachette | `purge-on-crash` | D32, no per-object fsync; purge after unclean run |
-| cachette | `fsync` | D32, file fsync before publication; no directory fsync |
+| cachette | `purge-on-crash` | no per-object fsync; the store is purged after an unclean run |
+| cachette | `fsync` | file fsync before publication; no directory fsync |
 | nginx | no fsync | `dav` and `dav-ext` modules, sendfile, automatic workers |
 | fosterstack | file fsync + bbolt | default admission limit of 32 uploads retained |
 | bazel-remote | file fsync | uncompressed CAS; endpoint metrics disabled |
 
 cachette builds from the current checkout as a static musl binary in
-`cachette.Dockerfile`, using the repository's release profile and allocator
-(D39), packaged in scratch. The runner does not override workers, allocator,
+`cachette.Dockerfile`, using the repository's release profile and allocator,
+packaged in scratch. The runner does not override workers, allocator,
 TCP settings or release flags to improve results. The builder compiles with
 two jobs and copies only Cargo manifests and `src/`, excluding host build outputs
 and benchmark reports from its inputs. TOML uses `durability`, not
@@ -127,7 +71,7 @@ HTTP path: they contain no cachette figures.
   latest published release verified 2026-11-06, official Linux amd64 digest
   `sha256:10285c1183e606679eb450b725c2495c055a45eb532a6c80f6b6f9771f6d2f67`.
   Its entrypoint is overridden to disable profiling and gRPC. Endpoint metrics
-  are explicitly disabled (D30). CAS hash checking and default disk-I/O admission
+  are explicitly disabled. CAS hash checking and default disk-I/O admission
   remain. UID 0 matches disposable bind-mount permissions on the other servers.
 - nginx packages and image identities/layers for all builds are recorded.
   A live PROPFIND must return 207. Tags and apt repositories can move;
@@ -184,7 +128,8 @@ frequency changes, warmup and in-flight drain are confounders, not established
 causes. Replay on a quiet host for 30 seconds before drawing a conclusion.
 Loopback shares client/server CPU and memory. Page cache is hot; no cold-disk
 or remote-network claim follows. A successful PUT is not proof of retention
-(cachette can acknowledge dropped uploads with 200). True Gradle/sccache build
+(a cachette under its ceiling drops uploads it cannot store; the reports record
+the statuses it answered). True Gradle/sccache build
 results come from the `clients` workflow, not from this benchmark.
 
 ## Recorded runs
@@ -207,19 +152,10 @@ measurements, with raw evidence consolidated into each Markdown file:
   established for variation; these shared-host results do not justify a stable PUT
   ranking. The final renderer fixes table formatting without changing raw
   observations.
-
-  The Tailscale timed run was refused: client host load 34.13 exceeded the default
-  2 on 2026-11-06. No network throughput/CPU benchmark result is published. The
-  remote replay command above remains required when both hosts are quiet.
-  Functional startup probes did confirm that each competitor binds only the server
-  host's Tailscale IPv4 and serves a 4 KiB GET to the client host (200); bazel's
-  body matched its CAS key. They intentionally stop before timed load and publish
-  no benchmark result. Their diagnostic failure reports remain outside the
-  repository.
 - [4 GiB, three servers, 5 s](results/2026-11-06T174832Z-linux-x86_64-16t.md):
   108 measurements, all GET repeat pairs within ±10%; 10/54 points unstable, all
   PUT. No timed HTTP errors for nginx/bazel; foster predominantly 429 at PUT/c64.
-  All 1152 pressure PUTs are 2xx. This predates the 64 KiB point and Tailscale path.
+  All 1152 pressure PUTs are 2xx. This predates the 64 KiB point.
 - [1 GiB, three servers, 5 s](results/2026-11-06T173458Z-linux-x86_64-16t.md):
   108 measurements, 7/54 points unstable. bazel returns predominantly 507 at
   PUT 32 MiB/c64; those uploads can exceed the cap. This is capacity-constrained
@@ -236,6 +172,5 @@ python3 -B bench/run.py --preflight-only
 
 Boundary tests cover load/ports (including 18083), both cachette modes and size
 boundary, all-process RSS, CAS addresses and unique pressure bodies, goodput/error
-accounting, disappearing files without hiding permission errors, the report name
-and host field against the machine label, and remote `~/` paths. Mutation results
-and runtime commands are recorded in the PR body.
+accounting, disappearing files without hiding permission errors, and the report name
+and host field against the machine label.

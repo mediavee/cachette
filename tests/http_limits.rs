@@ -1,5 +1,5 @@
 //! Black-box tests of what the server does with bodies it does not store, bodies that stall, and
-//! requests in flight at shutdown (D5, D7, D17, D19).
+//! requests in flight at shutdown.
 
 mod common;
 
@@ -20,7 +20,7 @@ fn payload(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// The daemon of D5's proof: objects above 1 MiB are not stored, and a client may send 8 MiB.
+/// A daemon where objects above 1 MiB are not stored, and a client may send 8 MiB.
 fn small_object_daemon() -> Daemon {
     Daemon::start_with(&[], &[("CACHETTE_MAX_OBJECT_SIZE", "1MiB")])
 }
@@ -45,10 +45,7 @@ fn an_oversized_put_without_expect_is_read_to_its_end_and_answered_413() {
     wire.send(&body)
         .expect("the server must keep reading the body");
     let reply = wire.read_reply().expect("response");
-    assert_eq!(
-        reply.status, 413,
-        "a PUT that is not stored answers 413 (D5)"
-    );
+    assert_eq!(reply.status, 413, "a PUT that is not stored answers 413");
     assert!(!reply.closes(), "{:?}", reply.headers);
 
     // The same connection still works.
